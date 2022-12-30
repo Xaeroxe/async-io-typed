@@ -18,7 +18,7 @@ use std::{
     collections::VecDeque,
     io,
     marker::PhantomData,
-    mem,
+    mem::{self},
     pin::Pin,
     task::{Context, Poll},
 };
@@ -47,10 +47,7 @@ impl<RW: AsyncRead + AsyncWrite, T: Serialize + DeserializeOwned + Unpin> Duplex
     /// Creates a duplex typed reader and writer, initializing it with the given size limit specified in bytes.
     ///
     /// Be careful, large limits might create a vulnerability to a Denial of Service attack.
-    pub fn new_with_limit(
-        rw: RW,
-        size_limit: u64,
-    ) -> Self {
+    pub fn new_with_limit(rw: RW, size_limit: u64) -> Self {
         Self {
             rw,
             read_state: AsyncReadState::Idle,
@@ -64,9 +61,19 @@ impl<RW: AsyncRead + AsyncWrite, T: Serialize + DeserializeOwned + Unpin> Duplex
     pub fn new(rw: RW) -> Self {
         Self::new_with_limit(rw, 1024_u64.pow(2))
     }
+
+    pub fn inner(&self) -> &RW {
+        &self.rw
+    }
+
+    pub fn into_inner(self) -> RW {
+        self.rw
+    }
 }
 
-impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> Stream for DuplexStreamTyped<RW, T> {
+impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> Stream
+    for DuplexStreamTyped<RW, T>
+{
     type Item = Result<T, Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -80,7 +87,9 @@ impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin
     }
 }
 
-impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> Sink<T> for DuplexStreamTyped<RW, T> {
+impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> Sink<T>
+    for DuplexStreamTyped<RW, T>
+{
     type Error = Error;
 
     fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -103,9 +112,7 @@ impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin
         match AsyncWriteTyped::maybe_send(rw, *size_limit, write_state, primed_values, cx, false) {
             Poll::Ready(Ok(Some(()))) => {
                 // Send successful, poll_flush now
-                Pin::new(rw)
-                    .poll_flush(cx)
-                    .map(|r| r.map_err(Error::Io))
+                Pin::new(rw).poll_flush(cx).map(|r| r.map_err(Error::Io))
             }
             Poll::Ready(Ok(None)) => Poll::Ready(Ok(())),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -124,9 +131,7 @@ impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin
         match AsyncWriteTyped::maybe_send(rw, *size_limit, write_state, primed_values, cx, true) {
             Poll::Ready(Ok(Some(()))) => {
                 // Send successful, poll_close now
-                Pin::new(rw)
-                    .poll_close(cx)
-                    .map(|r| r.map_err(Error::Io))
+                Pin::new(rw).poll_close(cx).map(|r| r.map_err(Error::Io))
             }
             Poll::Ready(Ok(None)) => Poll::Ready(Ok(())),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -187,7 +192,9 @@ enum AsyncReadState {
     Finished,
 }
 
-impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> Stream for AsyncReadTyped<R, T> {
+impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> Stream
+    for AsyncReadTyped<R, T>
+{
     type Item = Result<T, Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -215,7 +222,20 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncReadTyp
         Self::new_with_limit(raw, 1024u64.pow(2))
     }
 
-    fn poll_next_impl(state: &mut AsyncReadState, mut raw: &mut R, size_limit: u64, cx: &mut Context) -> Poll<Option<Result<T, Error>>> {
+    pub fn inner(&self) -> &R {
+        &self.raw
+    }
+
+    pub fn into_inner(self) -> R {
+        self.raw
+    }
+
+    fn poll_next_impl(
+        state: &mut AsyncReadState,
+        mut raw: &mut R,
+        size_limit: u64,
+        cx: &mut Context,
+    ) -> Poll<Option<Result<T, Error>>> {
         loop {
             return match state {
                 AsyncReadState::Idle => {
@@ -258,7 +278,8 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncReadTyp
                                 other => {
                                     *state = AsyncReadState::ReadingItem {
                                         current_item_len: other as usize,
-                                        current_item_buffer: vec![0; other as usize].into_boxed_slice(),
+                                        current_item_buffer: vec![0; other as usize]
+                                            .into_boxed_slice(),
                                         len_read: 0,
                                     };
                                 }
@@ -290,10 +311,12 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncReadTyp
                                 let new_len = match len_read_mode {
                                     LenReadMode::U16 => u16::from_le_bytes(
                                         (&len_in_progress[0..2]).try_into().expect("infallible"),
-                                    ) as u64,
+                                    )
+                                        as u64,
                                     LenReadMode::U32 => u32::from_le_bytes(
                                         (&len_in_progress[0..4]).try_into().expect("infallible"),
-                                    ) as u64,
+                                    )
+                                        as u64,
                                     LenReadMode::U64 => u64::from_le_bytes(*len_in_progress),
                                 };
                                 if new_len > size_limit {
@@ -303,7 +326,8 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncReadTyp
                                 *state = AsyncReadState::ReadingItem {
                                     len_read: 0,
                                     current_item_len: new_len as usize,
-                                    current_item_buffer: vec![0; new_len as usize].into_boxed_slice(),
+                                    current_item_buffer: vec![0; new_len as usize]
+                                        .into_boxed_slice(),
                                 };
                             }
                             continue;
@@ -311,14 +335,16 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncReadTyp
                         Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(Error::Io(e)))),
                         Poll::Pending => return Poll::Pending,
                     }
-                },
+                }
                 AsyncReadState::ReadingItem {
                     ref mut len_read,
                     ref mut current_item_len,
                     ref mut current_item_buffer,
                 } => {
                     while *len_read < *current_item_len {
-                        match Pin::new(&mut raw).poll_read(cx, &mut current_item_buffer[*len_read..]) {
+                        match Pin::new(&mut raw)
+                            .poll_read(cx, &mut current_item_buffer[*len_read..])
+                        {
                             Poll::Ready(Ok(len)) => {
                                 *len_read += len;
                                 if *len_read == *current_item_len {
@@ -353,7 +379,7 @@ enum LenReadMode {
 /// The write half of a [LocalSocketStreamTyped], generated by [LocalSocketStreamTyped::into_split]
 #[derive(Debug)]
 pub struct AsyncWriteTyped<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> {
-    raw: W,
+    raw: Option<W>,
     size_limit: u64,
     state: AsyncWriteState,
     primed_values: VecDeque<T>,
@@ -375,7 +401,9 @@ enum AsyncWriteState {
     Closed,
 }
 
-impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> Sink<T> for AsyncWriteTyped<W, T> {
+impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> Sink<T>
+    for AsyncWriteTyped<W, T>
+{
     type Error = Error;
 
     fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -394,10 +422,17 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> Sink<T> for
             ref mut state,
             ref mut primed_values,
         } = *self.as_mut();
-        match Self::maybe_send(raw, *size_limit, state, primed_values, cx, false) {
+        match Self::maybe_send(
+            raw.as_mut().expect("infallible"),
+            *size_limit,
+            state,
+            primed_values,
+            cx,
+            false,
+        ) {
             Poll::Ready(Ok(Some(()))) => {
                 // Send successful, poll_flush now
-                Pin::new(raw)
+                Pin::new(raw.as_mut().expect("infallible"))
                     .poll_flush(cx)
                     .map(|r| r.map_err(Error::Io))
             }
@@ -414,10 +449,17 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> Sink<T> for
             ref mut state,
             ref mut primed_values,
         } = *self.as_mut();
-        match Self::maybe_send(raw, *size_limit, state, primed_values, cx, true) {
+        match Self::maybe_send(
+            raw.as_mut().expect("infallible"),
+            *size_limit,
+            state,
+            primed_values,
+            cx,
+            true,
+        ) {
             Poll::Ready(Ok(Some(()))) => {
                 // Send successful, poll_close now
-                Pin::new(raw)
+                Pin::new(raw.as_mut().expect("infallible"))
                     .poll_close(cx)
                     .map(|r| r.map_err(Error::Io))
             }
@@ -572,7 +614,7 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncWriteT
 impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncWriteTyped<W, T> {
     pub fn new_with_limit(raw: W, size_limit: u64) -> Self {
         Self {
-            raw,
+            raw: Some(raw),
             size_limit,
             state: AsyncWriteState::Idle,
             primed_values: VecDeque::new(),
@@ -582,10 +624,23 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncWriteT
     pub fn new(raw: W) -> Self {
         Self::new_with_limit(raw, 1024u64.pow(2))
     }
+
+    pub fn inner(&self) -> &W {
+        self.raw.as_ref().expect("infallible")
+    }
+
+    pub fn into_inner(mut self) -> W {
+        self.raw.take().expect("infallible")
+    }
 }
 
-impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> Drop for AsyncWriteTyped<W, T> {
+impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> Drop
+    for AsyncWriteTyped<W, T>
+{
     fn drop(&mut self) {
-        let _ = futures_executor::block_on(SinkExt::close(self));
+        // This will panic if raw was already taken.
+        if self.raw.is_some() {
+            let _ = futures_executor::block_on(SinkExt::close(self));
+        }
     }
 }
