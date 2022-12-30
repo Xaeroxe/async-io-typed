@@ -167,7 +167,7 @@ fn bincode_options(size_limit: u64) -> impl Options {
         .reject_trailing_bytes()
 }
 
-/// Provides the ability to read `serde` compatible types from any type that implements `tokio::io::AsyncRead`.
+/// Provides the ability to read `serde` compatible types from any type that implements `futures::io::AsyncRead`.
 #[derive(Debug)]
 pub struct AsyncReadTyped<R, T: Serialize + DeserializeOwned + Unpin> {
     raw: R,
@@ -380,7 +380,7 @@ enum LenReadMode {
     U64,
 }
 
-/// Provides the ability to write `serde` compatible types to any type that implements `tokio::io::AsyncWrite`.
+/// Provides the ability to write `serde` compatible types to any type that implements `futures::io::AsyncWrite`.
 #[derive(Debug)]
 pub struct AsyncWriteTyped<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> {
     raw: Option<W>,
