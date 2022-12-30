@@ -1,4 +1,11 @@
-# async-io-typed
+# async-io-typed [![Build Status]][actions] [![Latest Version]][crates.io]
+
+[Build Status]: https://img.shields.io/github/actions/workflow/status/Xaeroxe/async-io-typed/ci.yml?branch=master
+[actions]: https://github.com/Xaeroxe/async-io-typed/actions?query=branch%3Amaster
+[Latest Version]: https://img.shields.io/crates/v/async-io-typed.svg
+[crates.io]: https://crates.io/crates/async-io-typed
+
+[Documentation](https://docs.rs/async-io-typed)
 
 Combines [`bincode`](https://github.com/bincode-org/bincode) and [`tokio`](https://github.com/tokio-rs/tokio) to
 adapt any `AsyncRead` or `AsyncWrite` type into a channel for transmission of [`serde`](https://github.com/serde-rs/serde)
