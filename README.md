@@ -1,6 +1,6 @@
 # async-io-typed [![Build Status]][actions] [![Latest Version]][crates.io]
 
-[Build Status]: https://img.shields.io/github/actions/workflow/status/Xaeroxe/async-io-typed/rust.yml?branch=master
+[Build Status]: https://img.shields.io/github/actions/workflow/status/Xaeroxe/async-io-typed/rust.yml?branch=main
 [actions]: https://github.com/Xaeroxe/async-io-typed/actions?query=branch%3Amaster
 [Latest Version]: https://img.shields.io/crates/v/async-io-typed.svg
 [crates.io]: https://crates.io/crates/async-io-typed
