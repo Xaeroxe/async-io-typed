@@ -1,7 +1,12 @@
 [package]
 name = "async-io-typed"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Adapts any AsyncRead or AsyncWrite type to send serde compatible types"
+readme = "README.md"
+repository = "https://github.com/Xaeroxe/interprocess-typed"
+documentation = "https://docs.rs/async-io-typed/"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
