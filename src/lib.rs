@@ -114,7 +114,7 @@ impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin
             ref mut primed_values,
             ..
         } = *self.as_mut();
-        match AsyncWriteTyped::maybe_send(
+        match futures_core::ready!(AsyncWriteTyped::maybe_send(
             rw,
             *size_limit,
             write_state,
@@ -122,14 +122,12 @@ impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin
             primed_values,
             cx,
             false,
-        ) {
-            Poll::Ready(Ok(Some(()))) => {
+        ))? {
+            Some(()) => {
                 // Send successful, poll_flush now
                 Pin::new(rw).poll_flush(cx).map(|r| r.map_err(Error::Io))
             }
-            Poll::Ready(Ok(None)) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
+            None => Poll::Ready(Ok(())),
         }
     }
 
@@ -142,7 +140,7 @@ impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin
             ref mut primed_values,
             ..
         } = *self.as_mut();
-        match AsyncWriteTyped::maybe_send(
+        match futures_core::ready!(AsyncWriteTyped::maybe_send(
             rw,
             *size_limit,
             write_state,
@@ -150,14 +148,12 @@ impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin
             primed_values,
             cx,
             true,
-        ) {
-            Poll::Ready(Ok(Some(()))) => {
+        ))? {
+            Some(()) => {
                 // Send successful, poll_close now
                 Pin::new(rw).poll_close(cx).map(|r| r.map_err(Error::Io))
             }
-            Poll::Ready(Ok(None)) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
+            None => Poll::Ready(Ok(())),
         }
     }
 }
@@ -167,10 +163,10 @@ impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin
 pub enum Error {
     /// Error from `std::io`
     #[error("io error {0}")]
-    Io(io::Error),
+    Io(#[from] io::Error),
     /// Error from the `bincode` crate
     #[error("bincode serialization/deserialization error {0}")]
-    Bincode(bincode::Error),
+    Bincode(#[from] bincode::Error),
     /// A message was sent that exceeded the configured length limit
     #[error("message sent exceeded configured length limit")]
     SentMessageTooLarge,
@@ -268,51 +264,46 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncReadTyp
             return match state {
                 AsyncReadState::Idle => {
                     let mut buf = [0];
-                    match Pin::new(&mut raw).poll_read(cx, &mut buf) {
-                        Poll::Ready(Ok(_len)) => {
-                            match buf[0] {
-                                U16_MARKER => {
-                                    *state = AsyncReadState::ReadingLen {
-                                        len_read_mode: LenReadMode::U16,
-                                        len_in_progress: Default::default(),
-                                        len_in_progress_assigned: 0,
-                                    };
-                                }
-                                U32_MARKER => {
-                                    *state = AsyncReadState::ReadingLen {
-                                        len_read_mode: LenReadMode::U32,
-                                        len_in_progress: Default::default(),
-                                        len_in_progress_assigned: 0,
-                                    };
-                                }
-                                U64_MARKER => {
-                                    *state = AsyncReadState::ReadingLen {
-                                        len_read_mode: LenReadMode::U64,
-                                        len_in_progress: Default::default(),
-                                        len_in_progress_assigned: 0,
-                                    };
-                                }
-                                ZST_MARKER => {
-                                    return Poll::Ready(Some(
-                                        bincode_options(size_limit)
-                                            .deserialize(&[])
-                                            .map_err(Error::Bincode),
-                                    ));
-                                }
-                                0 => {
-                                    *state = AsyncReadState::Finished;
-                                    return Poll::Ready(None);
-                                }
-                                other => {
-                                    item_buffer.resize(other as usize, 0);
-                                    *state = AsyncReadState::ReadingItem { len_read: 0 };
-                                }
-                            }
-                            continue;
+                    futures_core::ready!(Pin::new(&mut raw).poll_read(cx, &mut buf))?;
+                    match buf[0] {
+                        U16_MARKER => {
+                            *state = AsyncReadState::ReadingLen {
+                                len_read_mode: LenReadMode::U16,
+                                len_in_progress: Default::default(),
+                                len_in_progress_assigned: 0,
+                            };
                         }
-                        Poll::Ready(Err(e)) => Poll::Ready(Some(Err(Error::Io(e)))),
-                        Poll::Pending => Poll::Pending,
+                        U32_MARKER => {
+                            *state = AsyncReadState::ReadingLen {
+                                len_read_mode: LenReadMode::U32,
+                                len_in_progress: Default::default(),
+                                len_in_progress_assigned: 0,
+                            };
+                        }
+                        U64_MARKER => {
+                            *state = AsyncReadState::ReadingLen {
+                                len_read_mode: LenReadMode::U64,
+                                len_in_progress: Default::default(),
+                                len_in_progress_assigned: 0,
+                            };
+                        }
+                        ZST_MARKER => {
+                            return Poll::Ready(Some(
+                                bincode_options(size_limit)
+                                    .deserialize(&[])
+                                    .map_err(Error::Bincode),
+                            ));
+                        }
+                        0 => {
+                            *state = AsyncReadState::Finished;
+                            return Poll::Ready(None);
+                        }
+                        other => {
+                            item_buffer.resize(other as usize, 0);
+                            *state = AsyncReadState::ReadingItem { len_read: 0 };
+                        }
                     }
+                    continue;
                 }
                 AsyncReadState::ReadingLen {
                     ref mut len_read_mode,
@@ -326,47 +317,37 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncReadTyp
                         LenReadMode::U32 => &mut buf[0..(4 - accumulated)],
                         LenReadMode::U64 => &mut buf[0..(8 - accumulated)],
                     };
-                    match Pin::new(&mut raw).poll_read(cx, slice) {
-                        Poll::Ready(Ok(len)) => {
-                            len_in_progress[accumulated..(accumulated + slice.len())]
-                                .copy_from_slice(&slice[..len]);
-                            *len_in_progress_assigned += len as u8;
-                            if len == slice.len() {
-                                let new_len = match len_read_mode {
-                                    LenReadMode::U16 => u16::from_le_bytes(
-                                        (&len_in_progress[0..2]).try_into().expect("infallible"),
-                                    )
-                                        as u64,
-                                    LenReadMode::U32 => u32::from_le_bytes(
-                                        (&len_in_progress[0..4]).try_into().expect("infallible"),
-                                    )
-                                        as u64,
-                                    LenReadMode::U64 => u64::from_le_bytes(*len_in_progress),
-                                };
-                                if new_len > size_limit {
-                                    *state = AsyncReadState::Finished;
-                                    return Poll::Ready(Some(Err(Error::ReceivedMessageTooLarge)));
-                                }
-                                item_buffer.resize(new_len as usize, 0);
-                                *state = AsyncReadState::ReadingItem { len_read: 0 };
-                            }
-                            continue;
+                    let len = futures_core::ready!(Pin::new(&mut raw).poll_read(cx, slice))?;
+                    len_in_progress[accumulated..(accumulated + slice.len())]
+                        .copy_from_slice(&slice[..len]);
+                    *len_in_progress_assigned += len as u8;
+                    if len == slice.len() {
+                        let new_len = match len_read_mode {
+                            LenReadMode::U16 => u16::from_le_bytes(
+                                (&len_in_progress[0..2]).try_into().expect("infallible"),
+                            )
+                                as u64,
+                            LenReadMode::U32 => u32::from_le_bytes(
+                                (&len_in_progress[0..4]).try_into().expect("infallible"),
+                            )
+                                as u64,
+                            LenReadMode::U64 => u64::from_le_bytes(*len_in_progress),
+                        };
+                        if new_len > size_limit {
+                            *state = AsyncReadState::Finished;
+                            return Poll::Ready(Some(Err(Error::ReceivedMessageTooLarge)));
                         }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(Error::Io(e)))),
-                        Poll::Pending => return Poll::Pending,
+                        item_buffer.resize(new_len as usize, 0);
+                        *state = AsyncReadState::ReadingItem { len_read: 0 };
                     }
+                    continue;
                 }
                 AsyncReadState::ReadingItem { ref mut len_read } => {
                     while *len_read < item_buffer.len() {
-                        match Pin::new(&mut raw).poll_read(cx, &mut item_buffer[*len_read..]) {
-                            Poll::Ready(Ok(len)) => {
-                                *len_read += len;
-                                if *len_read == item_buffer.len() {
-                                    break;
-                                }
-                            }
-                            Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(Error::Io(e)))),
-                            Poll::Pending => return Poll::Pending,
+                        let len = futures_core::ready!(Pin::new(&mut raw).poll_read(cx, &mut item_buffer[*len_read..]))?;
+                        *len_read += len;
+                        if *len_read == item_buffer.len() {
+                            break;
                         }
                     }
                     let ret = Poll::Ready(Some(
@@ -436,7 +417,7 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> Sink<T>
             ref mut state,
             ref mut primed_values,
         } = *self.as_mut();
-        match Self::maybe_send(
+        match futures_core::ready!(Self::maybe_send(
             raw.as_mut().expect("infallible"),
             *size_limit,
             state,
@@ -444,16 +425,14 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> Sink<T>
             primed_values,
             cx,
             false,
-        ) {
-            Poll::Ready(Ok(Some(()))) => {
+        ))? {
+            Some(()) => {
                 // Send successful, poll_flush now
                 Pin::new(raw.as_mut().expect("infallible"))
                     .poll_flush(cx)
                     .map(|r| r.map_err(Error::Io))
             }
-            Poll::Ready(Ok(None)) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
+            None => Poll::Ready(Ok(())),
         }
     }
 
@@ -465,7 +444,7 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> Sink<T>
             ref mut write_buffer,
             ref mut primed_values,
         } = *self.as_mut();
-        match Self::maybe_send(
+        match futures_core::ready!(Self::maybe_send(
             raw.as_mut().expect("infallible"),
             *size_limit,
             state,
@@ -473,16 +452,14 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> Sink<T>
             primed_values,
             cx,
             true,
-        ) {
-            Poll::Ready(Ok(Some(()))) => {
+        ))? {
+            Some(()) => {
                 // Send successful, poll_close now
                 Pin::new(raw.as_mut().expect("infallible"))
                     .poll_close(cx)
                     .map(|r| r.map_err(Error::Io))
             }
-            Poll::Ready(Ok(None)) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
+            None => Poll::Ready(Ok(())),
         }
     }
 }
@@ -534,28 +511,20 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncWriteT
                                 9,
                             )
                         };
-                        match Pin::new(&mut *raw).poll_write(cx, &new_current_len[0..to_be_sent]) {
-                            Poll::Ready(Ok(len)) => {
-                                if len == to_be_sent {
-                                    *state = AsyncWriteState::WritingValue { bytes_sent: 0 };
-                                    continue;
-                                } else {
-                                    *state = AsyncWriteState::WritingLen {
-                                        current_len: new_current_len,
-                                        len_to_be_sent: (to_be_sent - len) as u8,
-                                    };
-                                    continue;
-                                }
+                        *state = AsyncWriteState::WritingLen {
+                            current_len: new_current_len,
+                            len_to_be_sent: to_be_sent as u8,
+                        };
+                        let len = futures_core::ready!(Pin::new(&mut *raw).poll_write(cx, &new_current_len[0..to_be_sent]))?;
+                        *state = if len == to_be_sent {
+                            AsyncWriteState::WritingValue { bytes_sent: 0 }
+                        } else {
+                            AsyncWriteState::WritingLen {
+                                current_len: new_current_len,
+                                len_to_be_sent: (to_be_sent - len) as u8,
                             }
-                            Poll::Ready(Err(e)) => Poll::Ready(Err(Error::Io(e))),
-                            Poll::Pending => {
-                                *state = AsyncWriteState::WritingLen {
-                                    current_len: new_current_len,
-                                    len_to_be_sent: to_be_sent as u8,
-                                };
-                                Poll::Pending
-                            }
-                        }
+                        };
+                        continue;
                     } else if closing {
                         *state = AsyncWriteState::Closing;
                         continue;
@@ -567,52 +536,34 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncWriteT
                     current_len,
                     len_to_be_sent,
                 } => {
-                    match Pin::new(&mut *raw)
-                        .poll_write(cx, &current_len[0..(*len_to_be_sent as usize)])
-                    {
-                        Poll::Ready(Ok(len)) => {
-                            if len == *len_to_be_sent as usize {
-                                *state = AsyncWriteState::WritingValue { bytes_sent: 0 };
-                                continue;
-                            } else {
-                                *len_to_be_sent -= len as u8;
-                                continue;
-                            }
-                        }
-                        Poll::Ready(Err(e)) => Poll::Ready(Err(Error::Io(e))),
-                        Poll::Pending => Poll::Pending,
+                    let len = futures_core::ready!(Pin::new(&mut *raw)
+                        .poll_write(cx, &current_len[0..(*len_to_be_sent as usize)]))?;
+                    if len == *len_to_be_sent as usize {
+                        *state = AsyncWriteState::WritingValue { bytes_sent: 0 };
+                    } else {
+                        *len_to_be_sent -= len as u8;
                     }
+                    continue;
                 }
                 AsyncWriteState::WritingValue { bytes_sent } => {
-                    match Pin::new(&mut *raw).poll_write(cx, &write_buffer[*bytes_sent..]) {
-                        Poll::Ready(Ok(len)) => {
-                            *bytes_sent += len;
-                            if *bytes_sent == write_buffer.len() {
-                                *state = AsyncWriteState::Idle;
-                                if primed_values.is_empty() {
-                                    Poll::Ready(Ok(Some(())))
-                                } else {
-                                    continue;
-                                }
-                            } else {
-                                continue;
-                            }
+                    let len = futures_core::ready!(Pin::new(&mut *raw).poll_write(cx, &write_buffer[*bytes_sent..]))?;
+                    *bytes_sent += len;
+                    if *bytes_sent == write_buffer.len() {
+                        *state = AsyncWriteState::Idle;
+                        if primed_values.is_empty() {
+                            return Poll::Ready(Ok(Some(())));
                         }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::Io(e))),
-                        Poll::Pending => return Poll::Pending,
                     }
+                    continue;
                 }
-                AsyncWriteState::Closing => match Pin::new(&mut *raw).poll_write(cx, &[0]) {
-                    Poll::Ready(Ok(len)) => {
-                        if len == 1 {
-                            *state = AsyncWriteState::Closed;
-                            Poll::Ready(Ok(Some(())))
-                        } else {
-                            continue;
-                        }
+                AsyncWriteState::Closing => {
+                    let len = futures_core::ready!(Pin::new(&mut *raw).poll_write(cx, &[0]))?;
+                    if len == 1 {
+                        *state = AsyncWriteState::Closed;
+                        Poll::Ready(Ok(Some(())))
+                    } else {
+                        continue;
                     }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::Io(e))),
-                    Poll::Pending => return Poll::Pending,
                 },
                 AsyncWriteState::Closed => Poll::Ready(Ok(None)),
             };

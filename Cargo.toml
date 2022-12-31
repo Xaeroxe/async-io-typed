@@ -12,6 +12,7 @@ documentation = "https://docs.rs/async-io-typed/"
 
 [dependencies]
 bincode = "1.3.3"
+futures-core = "0.3"
 futures-io = "0.3"
 futures-executor = "0.3"
 futures-util = { version = "0.3", features = ["sink"] }
