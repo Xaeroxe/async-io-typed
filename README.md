@@ -7,7 +7,7 @@
 
 [Documentation](https://docs.rs/async-io-typed)
 
-Combines [`bincode`](https://github.com/bincode-org/bincode) and [`tokio`](https://github.com/tokio-rs/tokio) to
+Combines [`bincode`](https://github.com/bincode-org/bincode) and [`futures`](https://github.com/rust-lang/futures-rs) to
 adapt any `AsyncRead` or `AsyncWrite` type into a channel for transmission of [`serde`](https://github.com/serde-rs/serde)
 compatible Rust types.
 
