@@ -18,7 +18,6 @@ use std::{
     collections::VecDeque,
     io,
     marker::PhantomData,
-    mem::{self},
     pin::Pin,
     task::{Context, Poll},
 };
@@ -38,7 +37,9 @@ const ZST_MARKER: u8 = 255;
 pub struct DuplexStreamTyped<RW, T: Serialize + DeserializeOwned + Unpin> {
     rw: RW,
     read_state: AsyncReadState,
+    read_buffer: Vec<u8>,
     write_state: AsyncWriteState,
+    write_buffer: Vec<u8>,
     primed_values: VecDeque<T>,
     size_limit: u64,
 }
@@ -51,7 +52,9 @@ impl<RW: AsyncRead + AsyncWrite, T: Serialize + DeserializeOwned + Unpin> Duplex
         Self {
             rw,
             read_state: AsyncReadState::Idle,
+            read_buffer: Vec::new(),
             write_state: AsyncWriteState::Idle,
+            write_buffer: Vec::new(),
             primed_values: VecDeque::new(),
             size_limit,
         }
@@ -80,10 +83,11 @@ impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin
         let Self {
             ref mut rw,
             ref mut read_state,
+            ref mut read_buffer,
             ref size_limit,
             ..
         } = *self.as_mut();
-        AsyncReadTyped::poll_next_impl(read_state, rw, *size_limit, cx)
+        AsyncReadTyped::poll_next_impl(read_state, rw, read_buffer, *size_limit, cx)
     }
 }
 
@@ -106,10 +110,19 @@ impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin
             ref mut rw,
             ref size_limit,
             ref mut write_state,
+            ref mut write_buffer,
             ref mut primed_values,
             ..
         } = *self.as_mut();
-        match AsyncWriteTyped::maybe_send(rw, *size_limit, write_state, primed_values, cx, false) {
+        match AsyncWriteTyped::maybe_send(
+            rw,
+            *size_limit,
+            write_state,
+            write_buffer,
+            primed_values,
+            cx,
+            false,
+        ) {
             Poll::Ready(Ok(Some(()))) => {
                 // Send successful, poll_flush now
                 Pin::new(rw).poll_flush(cx).map(|r| r.map_err(Error::Io))
@@ -125,10 +138,19 @@ impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin
             ref mut rw,
             ref size_limit,
             ref mut write_state,
+            ref mut write_buffer,
             ref mut primed_values,
             ..
         } = *self.as_mut();
-        match AsyncWriteTyped::maybe_send(rw, *size_limit, write_state, primed_values, cx, true) {
+        match AsyncWriteTyped::maybe_send(
+            rw,
+            *size_limit,
+            write_state,
+            write_buffer,
+            primed_values,
+            cx,
+            true,
+        ) {
             Poll::Ready(Ok(Some(()))) => {
                 // Send successful, poll_close now
                 Pin::new(rw).poll_close(cx).map(|r| r.map_err(Error::Io))
@@ -173,6 +195,7 @@ pub struct AsyncReadTyped<R, T: Serialize + DeserializeOwned + Unpin> {
     raw: R,
     size_limit: u64,
     state: AsyncReadState,
+    item_buffer: Vec<u8>,
     _phantom: PhantomData<T>,
 }
 
@@ -185,9 +208,7 @@ enum AsyncReadState {
         len_in_progress_assigned: u8,
     },
     ReadingItem {
-        current_item_len: usize,
         len_read: usize,
-        current_item_buffer: Box<[u8]>,
     },
     Finished,
 }
@@ -201,10 +222,11 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> Stream
         let Self {
             ref mut raw,
             ref size_limit,
+            ref mut item_buffer,
             ref mut state,
             _phantom,
         } = &mut *self;
-        Self::poll_next_impl(state, raw, *size_limit, cx)
+        Self::poll_next_impl(state, raw, item_buffer, *size_limit, cx)
     }
 }
 
@@ -217,6 +239,7 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncReadTyp
             raw,
             size_limit,
             state: AsyncReadState::Idle,
+            item_buffer: Vec::new(),
             _phantom: PhantomData,
         }
     }
@@ -237,6 +260,7 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncReadTyp
     fn poll_next_impl(
         state: &mut AsyncReadState,
         mut raw: &mut R,
+        item_buffer: &mut Vec<u8>,
         size_limit: u64,
         cx: &mut Context,
     ) -> Poll<Option<Result<T, Error>>> {
@@ -280,12 +304,8 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncReadTyp
                                     return Poll::Ready(None);
                                 }
                                 other => {
-                                    *state = AsyncReadState::ReadingItem {
-                                        current_item_len: other as usize,
-                                        current_item_buffer: vec![0; other as usize]
-                                            .into_boxed_slice(),
-                                        len_read: 0,
-                                    };
+                                    item_buffer.resize(other as usize, 0);
+                                    *state = AsyncReadState::ReadingItem { len_read: 0 };
                                 }
                             }
                             continue;
@@ -327,12 +347,8 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncReadTyp
                                     *state = AsyncReadState::Finished;
                                     return Poll::Ready(Some(Err(Error::ReceivedMessageTooLarge)));
                                 }
-                                *state = AsyncReadState::ReadingItem {
-                                    len_read: 0,
-                                    current_item_len: new_len as usize,
-                                    current_item_buffer: vec![0; new_len as usize]
-                                        .into_boxed_slice(),
-                                };
+                                item_buffer.resize(new_len as usize, 0);
+                                *state = AsyncReadState::ReadingItem { len_read: 0 };
                             }
                             continue;
                         }
@@ -340,18 +356,12 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncReadTyp
                         Poll::Pending => return Poll::Pending,
                     }
                 }
-                AsyncReadState::ReadingItem {
-                    ref mut len_read,
-                    ref mut current_item_len,
-                    ref mut current_item_buffer,
-                } => {
-                    while *len_read < *current_item_len {
-                        match Pin::new(&mut raw)
-                            .poll_read(cx, &mut current_item_buffer[*len_read..])
-                        {
+                AsyncReadState::ReadingItem { ref mut len_read } => {
+                    while *len_read < item_buffer.len() {
+                        match Pin::new(&mut raw).poll_read(cx, &mut item_buffer[*len_read..]) {
                             Poll::Ready(Ok(len)) => {
                                 *len_read += len;
-                                if *len_read == *current_item_len {
+                                if *len_read == item_buffer.len() {
                                     break;
                                 }
                             }
@@ -361,7 +371,7 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncReadTyp
                     }
                     let ret = Poll::Ready(Some(
                         bincode_options(size_limit)
-                            .deserialize(current_item_buffer)
+                            .deserialize(item_buffer)
                             .map_err(Error::Bincode),
                     ));
                     *state = AsyncReadState::Idle;
@@ -385,6 +395,7 @@ enum LenReadMode {
 pub struct AsyncWriteTyped<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> {
     raw: Option<W>,
     size_limit: u64,
+    write_buffer: Vec<u8>,
     state: AsyncWriteState,
     primed_values: VecDeque<T>,
 }
@@ -393,12 +404,10 @@ pub struct AsyncWriteTyped<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwne
 enum AsyncWriteState {
     Idle,
     WritingLen {
-        bytes_being_sent: Vec<u8>,
         current_len: [u8; 9],
         len_to_be_sent: u8,
     },
     WritingValue {
-        bytes_being_sent: Vec<u8>,
         bytes_sent: usize,
     },
     Closing,
@@ -423,6 +432,7 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> Sink<T>
         let Self {
             ref mut raw,
             ref size_limit,
+            ref mut write_buffer,
             ref mut state,
             ref mut primed_values,
         } = *self.as_mut();
@@ -430,6 +440,7 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> Sink<T>
             raw.as_mut().expect("infallible"),
             *size_limit,
             state,
+            write_buffer,
             primed_values,
             cx,
             false,
@@ -451,12 +462,14 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> Sink<T>
             ref mut raw,
             ref size_limit,
             ref mut state,
+            ref mut write_buffer,
             ref mut primed_values,
         } = *self.as_mut();
         match Self::maybe_send(
             raw.as_mut().expect("infallible"),
             *size_limit,
             state,
+            write_buffer,
             primed_values,
             cx,
             true,
@@ -479,6 +492,7 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncWriteT
         raw: &mut W,
         size_limit: u64,
         state: &mut AsyncWriteState,
+        write_buffer: &mut Vec<u8>,
         primed_values: &mut VecDeque<T>,
         cx: &mut Context<'_>,
         closing: bool,
@@ -487,22 +501,23 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncWriteT
             return match state {
                 AsyncWriteState::Idle => {
                     if let Some(item) = primed_values.pop_back() {
-                        let to_send = bincode_options(size_limit)
-                            .serialize(&item)
+                        write_buffer.clear();
+                        bincode_options(size_limit)
+                            .serialize_into(&mut *write_buffer, &item)
                             .map_err(Error::Bincode)?;
-                        if to_send.len() as u64 > size_limit {
+                        if write_buffer.len() as u64 > size_limit {
                             return Poll::Ready(Err(Error::SentMessageTooLarge));
                         }
-                        let (new_current_len, to_be_sent) = if to_send.is_empty() {
+                        let (new_current_len, to_be_sent) = if write_buffer.is_empty() {
                             ([ZST_MARKER, 0, 0, 0, 0, 0, 0, 0, 0], 1)
-                        } else if to_send.len() < U16_MARKER as usize {
-                            let bytes = (to_send.len() as u8).to_le_bytes();
+                        } else if write_buffer.len() < U16_MARKER as usize {
+                            let bytes = (write_buffer.len() as u8).to_le_bytes();
                             ([bytes[0], 0, 0, 0, 0, 0, 0, 0, 0], 1)
-                        } else if (to_send.len() as u64) < 2_u64.pow(16) {
-                            let bytes = (to_send.len() as u16).to_le_bytes();
+                        } else if (write_buffer.len() as u64) < 2_u64.pow(16) {
+                            let bytes = (write_buffer.len() as u16).to_le_bytes();
                             ([U16_MARKER, bytes[0], bytes[1], 0, 0, 0, 0, 0, 0], 3)
-                        } else if (to_send.len() as u64) < 2_u64.pow(32) {
-                            let bytes = (to_send.len() as u32).to_le_bytes();
+                        } else if (write_buffer.len() as u64) < 2_u64.pow(32) {
+                            let bytes = (write_buffer.len() as u32).to_le_bytes();
                             (
                                 [
                                     U32_MARKER, bytes[0], bytes[1], bytes[2], bytes[3], 0, 0, 0, 0,
@@ -510,7 +525,7 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncWriteT
                                 5,
                             )
                         } else {
-                            let bytes = (to_send.len() as u64).to_le_bytes();
+                            let bytes = (write_buffer.len() as u64).to_le_bytes();
                             (
                                 [
                                     U64_MARKER, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4],
@@ -522,16 +537,12 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncWriteT
                         match Pin::new(&mut *raw).poll_write(cx, &new_current_len[0..to_be_sent]) {
                             Poll::Ready(Ok(len)) => {
                                 if len == to_be_sent {
-                                    *state = AsyncWriteState::WritingValue {
-                                        bytes_being_sent: to_send,
-                                        bytes_sent: 0,
-                                    };
+                                    *state = AsyncWriteState::WritingValue { bytes_sent: 0 };
                                     continue;
                                 } else {
                                     *state = AsyncWriteState::WritingLen {
                                         current_len: new_current_len,
                                         len_to_be_sent: (to_be_sent - len) as u8,
-                                        bytes_being_sent: to_send,
                                     };
                                     continue;
                                 }
@@ -541,7 +552,6 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncWriteT
                                 *state = AsyncWriteState::WritingLen {
                                     current_len: new_current_len,
                                     len_to_be_sent: to_be_sent as u8,
-                                    bytes_being_sent: to_send,
                                 };
                                 Poll::Pending
                             }
@@ -556,17 +566,13 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncWriteT
                 AsyncWriteState::WritingLen {
                     current_len,
                     len_to_be_sent,
-                    bytes_being_sent,
                 } => {
                     match Pin::new(&mut *raw)
                         .poll_write(cx, &current_len[0..(*len_to_be_sent as usize)])
                     {
                         Poll::Ready(Ok(len)) => {
                             if len == *len_to_be_sent as usize {
-                                *state = AsyncWriteState::WritingValue {
-                                    bytes_being_sent: mem::take(bytes_being_sent),
-                                    bytes_sent: 0,
-                                };
+                                *state = AsyncWriteState::WritingValue { bytes_sent: 0 };
                                 continue;
                             } else {
                                 *len_to_be_sent -= len as u8;
@@ -577,26 +583,25 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncWriteT
                         Poll::Pending => Poll::Pending,
                     }
                 }
-                AsyncWriteState::WritingValue {
-                    bytes_being_sent,
-                    bytes_sent,
-                } => match Pin::new(&mut *raw).poll_write(cx, &bytes_being_sent[*bytes_sent..]) {
-                    Poll::Ready(Ok(len)) => {
-                        *bytes_sent += len;
-                        if *bytes_sent == bytes_being_sent.len() {
-                            *state = AsyncWriteState::Idle;
-                            if primed_values.is_empty() {
-                                Poll::Ready(Ok(Some(())))
+                AsyncWriteState::WritingValue { bytes_sent } => {
+                    match Pin::new(&mut *raw).poll_write(cx, &write_buffer[*bytes_sent..]) {
+                        Poll::Ready(Ok(len)) => {
+                            *bytes_sent += len;
+                            if *bytes_sent == write_buffer.len() {
+                                *state = AsyncWriteState::Idle;
+                                if primed_values.is_empty() {
+                                    Poll::Ready(Ok(Some(())))
+                                } else {
+                                    continue;
+                                }
                             } else {
                                 continue;
                             }
-                        } else {
-                            continue;
                         }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::Io(e))),
+                        Poll::Pending => return Poll::Pending,
                     }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::Io(e))),
-                    Poll::Pending => return Poll::Pending,
-                },
+                }
                 AsyncWriteState::Closing => match Pin::new(&mut *raw).poll_write(cx, &[0]) {
                     Poll::Ready(Ok(len)) => {
                         if len == 1 {
@@ -623,6 +628,7 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncWriteT
         Self {
             raw: Some(raw),
             size_limit,
+            write_buffer: Vec::new(),
             state: AsyncWriteState::Idle,
             primed_values: VecDeque::new(),
         }
