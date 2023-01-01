@@ -1,6 +1,6 @@
 [package]
 name = "async-io-typed"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Adapts any AsyncRead or AsyncWrite type to send serde compatible types"
@@ -21,4 +21,6 @@ thiserror = "1.0.37"
 
 [dev-dependencies]
 rand = "0.8"
-tokio = { version = "1.22.0", features = ["rt-multi-thread"]}
+tokio = { version = "1.22.0", features = ["rt-multi-thread", "sync", "macros", "time"]}
+tokio-util = "0.7"
+futures-util = { version = "0.3", features = ["io"] }
