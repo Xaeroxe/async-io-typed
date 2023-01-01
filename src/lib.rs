@@ -256,6 +256,20 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncReadTyp
         self.raw
     }
 
+    /// `AsyncReadTyped` keeps a memory buffer for receiving values which is the same size as the largest
+    /// message that's been received. If the message size varies a lot, you might find yourself wasting
+    /// memory space. This function will reduce the memory usage as much as is possible without impeding
+    /// functioning. Overuse of this function may cause excessive memory allocations when the buffer
+    /// needs to grow.
+    pub fn optimize_memory_usage(&mut self) {
+        match self.state {
+            AsyncReadState::ReadingItem { .. } => self.item_buffer.shrink_to_fit(),
+            _ => {
+                self.item_buffer = Vec::new();
+            }
+        }
+    }
+
     fn poll_next_impl(
         state: &mut AsyncReadState,
         mut raw: &mut R,
@@ -606,6 +620,22 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncWriteT
 
     pub fn into_inner(mut self) -> W {
         self.raw.take().expect("infallible")
+    }
+
+    /// `AsyncWriteTyped` keeps a memory buffer for sending values which is the same size as the largest
+    /// message that's been sent. If the message size varies a lot, you might find yourself wasting
+    /// memory space. This function will reduce the memory usage as much as is possible without impeding
+    /// functioning. Overuse of this function may cause excessive memory allocations when the buffer
+    /// needs to grow.
+    pub fn optimize_memory_usage(&mut self) {
+        match self.state {
+            AsyncWriteState::WritingLen { .. } | AsyncWriteState::WritingValue { .. } => {
+                self.write_buffer.shrink_to_fit()
+            }
+            _ => {
+                self.write_buffer = Vec::new();
+            }
+        }
     }
 }
 
