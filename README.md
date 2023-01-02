@@ -11,6 +11,24 @@ Combines [`bincode`](https://github.com/bincode-org/bincode) and [`futures`](htt
 adapt any `AsyncRead` or `AsyncWrite` type into a channel for transmission of [`serde`](https://github.com/serde-rs/serde)
 compatible Rust types.
 
+## Who needs this?
+
+If you have an endpoint you need to communicate with and
+
+- You can establish some kind of I/O connection to it (i.e. TCP, named pipes, or a unix socket)
+- You need clear message boundaries
+- You're not trying to conform to an existing wire format such as HTTP or protobufs. This crate uses a custom format.
+- The data you wish to send can be easily represented in a Rust type, and that type implements serde's `Deserialize` and `Serialize` traits.
+
+Then this crate might be useful to you!
+
+## Who doesn't need this?
+
+If the endpoint is in the same process then you should not use this crate. You're better served by existing async mpsc channels.
+Many crates provide async mpsc channels, including `futures` and `tokio`. Pick your favorite implementation. Additionally, if you're
+trying to interface with a process that doesn't have Rust code, and can't adopt a Rust portion, this crate will hurt much more than
+it will help. Consider using protobufs or JSON if Rust adoption is a blocker.
+
 ## Binary format
 
 ### Introduction
