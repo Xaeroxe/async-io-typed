@@ -1,6 +1,6 @@
 [package]
 name = "async-io-typed"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Adapts any AsyncRead or AsyncWrite type to send serde compatible types"
