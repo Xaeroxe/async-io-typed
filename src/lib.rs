@@ -363,9 +363,6 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncReadTyp
                             Pin::new(&mut raw).poll_read(cx, &mut item_buffer[*len_read..])
                         )?;
                         *len_read += len;
-                        if *len_read == item_buffer.len() {
-                            break;
-                        }
                     }
                     let ret = Poll::Ready(Some(
                         bincode_options(size_limit)
