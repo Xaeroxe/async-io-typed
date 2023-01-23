@@ -392,8 +392,8 @@ fn standard_test_parameter_set() -> impl Iterator<Item = TestParameters> {
         .chain(8..=10)
         .chain(Some(1024usize.pow(2)))
         .flat_map(|size| {
-            (0..1).map(move |sender_checksum_enabled| {
-                (0..1).map(move |receiver_checksum_enabled| {
+            (0..=1).map(move |sender_checksum_enabled| {
+                (0..=1).map(move |receiver_checksum_enabled| {
                     (
                         size,
                         sender_checksum_enabled == 1,
