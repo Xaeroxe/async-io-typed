@@ -117,6 +117,192 @@ fn basic_channel(max_size_per_write: usize) -> (BasicChannelSender, BasicChannel
     )
 }
 
+#[tokio::test]
+async fn bad_protocol_version() {
+    let (mut sender, receiver) = basic_channel(1024);
+    let mut typed_receiver = AsyncReadTyped::<_, u8>::new(receiver, false);
+    // Intentionally send a message with a bad checksum
+    let sent_value = 5;
+    let mut message = Vec::from(0u64.to_le_bytes());
+    message.push(CHECKSUM_ENABLED);
+    message.push(1);
+    message.push(sent_value);
+    message.extend(0u64.to_le_bytes());
+    sender.write_all(&message).await.unwrap();
+    let message = typed_receiver.next().await.unwrap();
+    assert!(matches!(
+        message,
+        Err(Error::ProtocolVersionMismatch {
+            our_version: PROTOCOL_VERSION,
+            their_version: 0
+        })
+    ));
+    assert!(typed_receiver.next().await.is_none());
+}
+
+#[tokio::test]
+async fn bad_checksum_enabled_value() {
+    let (mut sender, receiver) = basic_channel(1024);
+    let mut typed_receiver = AsyncReadTyped::<_, u8>::new(receiver, false);
+    // Intentionally send a message with a bad checksum
+    let sent_value = 5;
+    const BAD_CHECKSUM_ENABLED_VALUE: u8 = 42;
+    let mut message = Vec::from(PROTOCOL_VERSION.to_le_bytes());
+    message.push(BAD_CHECKSUM_ENABLED_VALUE);
+    message.push(1);
+    message.push(sent_value);
+    message.extend(0u64.to_le_bytes());
+    sender.write_all(&message).await.unwrap();
+    let message = typed_receiver.next().await.unwrap();
+    assert!(matches!(
+        message,
+        Err(Error::ChecksumHandshakeFailed {
+            checksum_value: BAD_CHECKSUM_ENABLED_VALUE
+        })
+    ));
+    assert!(typed_receiver.next().await.is_none());
+}
+
+#[tokio::test]
+async fn checksum_ignored() {
+    let (mut sender, receiver) = basic_channel(1024);
+    let mut typed_receiver = AsyncReadTyped::new(receiver, false);
+    // Intentionally send a message with a bad checksum
+    let sent_value = 5;
+    let mut message = Vec::from(PROTOCOL_VERSION.to_le_bytes());
+    message.push(CHECKSUM_ENABLED);
+    message.push(1);
+    message.push(sent_value);
+    message.extend(0u64.to_le_bytes());
+    sender.write_all(&message).await.unwrap();
+    let message: u8 = typed_receiver.next().await.unwrap().unwrap();
+    assert_eq!(message, sent_value);
+}
+
+#[tokio::test]
+async fn checksum_unavailable() {
+    let (mut sender, receiver) = basic_channel(1024);
+    let mut typed_receiver = AsyncReadTyped::<_, u8>::new(receiver, true);
+    assert!(typed_receiver.checksum_enabled());
+    // Send two message without checksums.
+    const SENT_VALUE: u8 = 5;
+    let mut message = Vec::from(PROTOCOL_VERSION.to_le_bytes());
+    message.push(CHECKSUM_DISABLED);
+    message.push(1);
+    message.push(SENT_VALUE);
+    sender.write_all(&message).await.unwrap();
+    let result = typed_receiver.next().await.unwrap();
+    assert!(!typed_receiver.checksum_enabled());
+    assert_eq!(result.unwrap(), SENT_VALUE);
+    const SENT_VALUE_2: u8 = 5;
+    message.clear();
+    message.push(1);
+    message.push(SENT_VALUE_2);
+    sender.write_all(&message).await.unwrap();
+    let result = typed_receiver.next().await.unwrap();
+    assert!(!typed_receiver.checksum_enabled());
+    assert_eq!(result.unwrap(), SENT_VALUE_2);
+}
+
+#[tokio::test]
+async fn checksum_used() {
+    let (mut sender, receiver) = basic_channel(1024);
+    let mut typed_receiver = AsyncReadTyped::<_, u8>::new(receiver, true);
+    // Intentionally send a message with a bad checksum
+    const SENT_VALUE: u8 = 5;
+    const SENT_VALUE_CHECKSUM: u64 = 10536747468361244917;
+    let mut message = Vec::from(PROTOCOL_VERSION.to_le_bytes());
+    message.push(CHECKSUM_ENABLED);
+    message.push(1);
+    message.push(SENT_VALUE);
+    message.extend(0u64.to_le_bytes());
+    sender.write_all(&message).await.unwrap();
+    let result = typed_receiver.next().await.unwrap();
+    assert!(typed_receiver.checksum_enabled());
+    assert!(matches!(
+        result,
+        Err(Error::ChecksumMismatch {
+            sent_checksum: 0,
+            computed_checksum: SENT_VALUE_CHECKSUM
+        })
+    ));
+    // Now send one with a good checksum.
+    message.clear();
+    message.push(1);
+    message.push(SENT_VALUE);
+    message.extend(SENT_VALUE_CHECKSUM.to_le_bytes());
+    sender.write_all(&message).await.unwrap();
+    let result = typed_receiver.next().await.unwrap();
+    assert!(typed_receiver.checksum_enabled());
+    assert_eq!(result.unwrap(), SENT_VALUE);
+}
+
+#[tokio::test]
+async fn checksum_unused() {
+    let (mut sender, receiver) = basic_channel(1024);
+    let mut typed_receiver = AsyncReadTyped::<_, u8>::new(receiver, true);
+    // Send two messages with no checksum
+    const SENT_VALUE: u8 = 5;
+    const SENT_VALUE_2: u8 = 20;
+    let mut message = Vec::from(PROTOCOL_VERSION.to_le_bytes());
+    message.push(CHECKSUM_DISABLED);
+    message.push(1);
+    message.push(SENT_VALUE);
+    message.push(1);
+    message.push(SENT_VALUE_2);
+    sender.write_all(&message).await.unwrap();
+    let result = typed_receiver.next().await.unwrap();
+    assert!(!typed_receiver.checksum_enabled());
+    assert_eq!(result.unwrap(), SENT_VALUE);
+    let result = typed_receiver.next().await.unwrap();
+    assert!(!typed_receiver.checksum_enabled());
+    assert_eq!(result.unwrap(), SENT_VALUE_2);
+}
+
+#[tokio::test]
+async fn checksum_sent() {
+    let (sender, mut receiver) = basic_channel(1024);
+    let mut typed_sender = AsyncWriteTyped::new(sender, true);
+    const SENT_VALUE: u8 = 5;
+    const SENT_VALUE_CHECKSUM: u64 = 10536747468361244917;
+    typed_sender.send(SENT_VALUE).await.unwrap();
+    const SENT_VALUE_2: u8 = 20;
+    const SENT_VALUE_2_CHECKSUM: u64 = 16424472559682478309;
+    typed_sender.send(SENT_VALUE_2).await.unwrap();
+    const READ_LENGTH: usize = 29;
+    let mut receive_buffer = [0; READ_LENGTH];
+    receiver.read_exact(&mut receive_buffer).await.unwrap();
+    let mut expected = Vec::from(PROTOCOL_VERSION.to_le_bytes());
+    expected.push(CHECKSUM_ENABLED);
+    expected.push(1);
+    expected.push(SENT_VALUE);
+    expected.extend(SENT_VALUE_CHECKSUM.to_le_bytes());
+    expected.push(1);
+    expected.push(SENT_VALUE_2);
+    expected.extend(SENT_VALUE_2_CHECKSUM.to_le_bytes());
+    assert_eq!(receive_buffer.as_slice(), expected.as_slice());
+}
+
+#[tokio::test]
+async fn checksum_not_sent() {
+    let (sender, mut receiver) = basic_channel(1024);
+    let mut typed_sender = AsyncWriteTyped::new(sender, false);
+    const SENT_VALUE: u8 = 5;
+    typed_sender.send(SENT_VALUE).await.unwrap();
+    const SENT_VALUE_2: u8 = 20;
+    typed_sender.send(SENT_VALUE_2).await.unwrap();
+    const READ_LENGTH: usize = 13;
+    let mut receive_buffer = [0; READ_LENGTH];
+    receiver.read_exact(&mut receive_buffer).await.unwrap();
+    let mut expected = Vec::from(PROTOCOL_VERSION.to_le_bytes());
+    expected.push(CHECKSUM_DISABLED);
+    expected.push(1);
+    expected.push(SENT_VALUE);
+    expected.push(1);
+    expected.push(SENT_VALUE_2);
+    assert_eq!(receive_buffer.as_slice(), expected.as_slice());
+}
+
 // This tests our testing equipment, just makes sure the above implementations are correct.
 #[tokio::test(flavor = "multi_thread")]
 async fn basic_channel_test() {
@@ -176,14 +362,16 @@ fn start_send_helper<T: Serialize + DeserializeOwned + Unpin + Send + 'static>(
 
 fn make_channel<T: DeserializeOwned + Serialize + Unpin>(
     max_size_per_write: usize,
+    sender_checksum_enabled: bool,
+    receiver_checksum_enabled: bool,
 ) -> (
     Option<AsyncWriteTyped<BasicChannelSender, T>>,
     AsyncReadTyped<BasicChannelReceiver, T>,
 ) {
     let (sender, receiver) = basic_channel(max_size_per_write);
     (
-        Some(AsyncWriteTyped::new(sender)),
-        AsyncReadTyped::new(receiver),
+        Some(AsyncWriteTyped::new(sender, sender_checksum_enabled)),
+        AsyncReadTyped::new(receiver, receiver_checksum_enabled),
     )
 }
 
@@ -198,14 +386,53 @@ fn bincode_options(size_limit: u64) -> impl Options {
         .reject_trailing_bytes()
 }
 
-fn interesting_sizes() -> impl Iterator<Item = usize> {
-    (1..=3).chain(8..=10).chain(Some(1024usize.pow(2)))
+fn standard_test_parameter_set() -> impl Iterator<Item = TestParameters> {
+    (1..=3)
+        .chain(8..=10)
+        .chain(Some(1024usize.pow(2)))
+        .map(|size| {
+            (0..1).map(move |sender_checksum_enabled| {
+                (0..1).map(move |receiver_checksum_enabled| {
+                    (
+                        size,
+                        sender_checksum_enabled == 1,
+                        receiver_checksum_enabled == 1,
+                    )
+                })
+            })
+        })
+        .flatten()
+        .flatten()
+        .map(
+            |(max_size_per_write, sender_checksum_enabled, receiver_checksum_enabled)| {
+                TestParameters {
+                    max_size_per_write,
+                    sender_checksum_enabled,
+                    receiver_checksum_enabled,
+                }
+            },
+        )
+}
+
+struct TestParameters {
+    max_size_per_write: usize,
+    sender_checksum_enabled: bool,
+    receiver_checksum_enabled: bool,
 }
 
 #[tokio::test]
 async fn zero_len_message() {
-    for size in interesting_sizes() {
-        let (mut server_stream, mut client_stream) = make_channel(size);
+    for TestParameters {
+        max_size_per_write,
+        sender_checksum_enabled,
+        receiver_checksum_enabled,
+    } in standard_test_parameter_set()
+    {
+        let (mut server_stream, mut client_stream) = make_channel(
+            max_size_per_write,
+            sender_checksum_enabled,
+            receiver_checksum_enabled,
+        );
         let fut = start_send_helper(server_stream.take().unwrap(), ());
         client_stream.next().await.unwrap().unwrap();
         fut.await.unwrap().1.unwrap();
@@ -214,8 +441,17 @@ async fn zero_len_message() {
 
 #[tokio::test]
 async fn zero_len_messages() {
-    for size in interesting_sizes() {
-        let (mut server_stream, mut client_stream) = make_channel(size);
+    for TestParameters {
+        max_size_per_write,
+        sender_checksum_enabled,
+        receiver_checksum_enabled,
+    } in standard_test_parameter_set()
+    {
+        let (mut server_stream, mut client_stream) = make_channel(
+            max_size_per_write,
+            sender_checksum_enabled,
+            receiver_checksum_enabled,
+        );
         for _ in 0..100 {
             let fut = start_send_helper(server_stream.take().unwrap(), ());
             client_stream.next().await.unwrap().unwrap();
@@ -228,8 +464,17 @@ async fn zero_len_messages() {
 
 #[tokio::test]
 async fn hello_world() {
-    for size in interesting_sizes() {
-        let (mut server_stream, mut client_stream) = make_channel(size);
+    for TestParameters {
+        max_size_per_write,
+        sender_checksum_enabled,
+        receiver_checksum_enabled,
+    } in standard_test_parameter_set()
+    {
+        let (mut server_stream, mut client_stream) = make_channel(
+            max_size_per_write,
+            sender_checksum_enabled,
+            receiver_checksum_enabled,
+        );
         let message = "Hello, world!".as_bytes().to_vec();
         let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
         assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
@@ -239,8 +484,17 @@ async fn hello_world() {
 
 #[tokio::test]
 async fn shutdown_after_hello_world() {
-    for size in interesting_sizes() {
-        let (mut server_stream, mut client_stream) = make_channel(size);
+    for TestParameters {
+        max_size_per_write,
+        sender_checksum_enabled,
+        receiver_checksum_enabled,
+    } in standard_test_parameter_set()
+    {
+        let (mut server_stream, mut client_stream) = make_channel(
+            max_size_per_write,
+            sender_checksum_enabled,
+            receiver_checksum_enabled,
+        );
         let message = "Hello, world!".as_bytes().to_vec();
         let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
         assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
@@ -254,8 +508,17 @@ async fn shutdown_after_hello_world() {
 
 #[tokio::test]
 async fn hello_worlds() {
-    for size in interesting_sizes() {
-        let (mut server_stream, mut client_stream) = make_channel(size);
+    for TestParameters {
+        max_size_per_write,
+        sender_checksum_enabled,
+        receiver_checksum_enabled,
+    } in standard_test_parameter_set()
+    {
+        let (mut server_stream, mut client_stream) = make_channel(
+            max_size_per_write,
+            sender_checksum_enabled,
+            receiver_checksum_enabled,
+        );
         for i in 0..100 {
             let message = format!("Hello, world {}!", i).into_bytes();
             let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
@@ -269,10 +532,18 @@ async fn hello_worlds() {
 
 #[tokio::test]
 async fn u16_marker_len_message() {
-    for size in interesting_sizes() {
+    for TestParameters {
+        max_size_per_write,
+        sender_checksum_enabled,
+        receiver_checksum_enabled,
+    } in standard_test_parameter_set()
+    {
+        let (mut server_stream, mut client_stream) = make_channel(
+            max_size_per_write,
+            sender_checksum_enabled,
+            receiver_checksum_enabled,
+        );
         let bincode_config = bincode_options(1024);
-
-        let (mut server_stream, mut client_stream) = make_channel(size);
         let message = (0..248).map(|_| 1).chain(Some(300)).collect::<Vec<_>>();
         assert_eq!(bincode_config.serialize(&message).unwrap().len(), 252);
         let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
@@ -283,9 +554,18 @@ async fn u16_marker_len_message() {
 
 #[tokio::test]
 async fn u32_marker_len_message() {
-    for size in interesting_sizes() {
+    for TestParameters {
+        max_size_per_write,
+        sender_checksum_enabled,
+        receiver_checksum_enabled,
+    } in standard_test_parameter_set()
+    {
+        let (mut server_stream, mut client_stream) = make_channel(
+            max_size_per_write,
+            sender_checksum_enabled,
+            receiver_checksum_enabled,
+        );
         let bincode_config = bincode_options(1024);
-        let (mut server_stream, mut client_stream) = make_channel(size);
         let message = (0..249).map(|_| 1).chain(Some(300)).collect::<Vec<_>>();
         assert_eq!(bincode_config.serialize(&message).unwrap().len(), 253);
         let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
@@ -296,9 +576,18 @@ async fn u32_marker_len_message() {
 
 #[tokio::test]
 async fn u64_marker_len_message() {
-    for size in interesting_sizes() {
+    for TestParameters {
+        max_size_per_write,
+        sender_checksum_enabled,
+        receiver_checksum_enabled,
+    } in standard_test_parameter_set()
+    {
+        let (mut server_stream, mut client_stream) = make_channel(
+            max_size_per_write,
+            sender_checksum_enabled,
+            receiver_checksum_enabled,
+        );
         let bincode_config = bincode_options(1024);
-        let (mut server_stream, mut client_stream) = make_channel(size);
         let message = (0..251).map(|_| 240u8).collect::<Vec<_>>();
         assert_eq!(bincode_config.serialize(&message).unwrap().len(), 254);
         let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
@@ -309,9 +598,18 @@ async fn u64_marker_len_message() {
 
 #[tokio::test]
 async fn zst_marker_len_message() {
-    for size in interesting_sizes() {
+    for TestParameters {
+        max_size_per_write,
+        sender_checksum_enabled,
+        receiver_checksum_enabled,
+    } in standard_test_parameter_set()
+    {
+        let (mut server_stream, mut client_stream) = make_channel(
+            max_size_per_write,
+            sender_checksum_enabled,
+            receiver_checksum_enabled,
+        );
         let bincode_config = bincode_options(1024);
-        let (mut server_stream, mut client_stream) = make_channel(size);
         let message = (0u8..252).collect::<Vec<_>>();
         assert_eq!(bincode_config.serialize(&message).unwrap().len(), 255);
         let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
@@ -323,8 +621,17 @@ async fn zst_marker_len_message() {
 #[tokio::test]
 async fn random_len_test() {
     use rand::Rng;
-    for size in interesting_sizes() {
-        let (mut server_stream, mut client_stream) = make_channel(size);
+    for TestParameters {
+        max_size_per_write,
+        sender_checksum_enabled,
+        receiver_checksum_enabled,
+    } in standard_test_parameter_set()
+    {
+        let (mut server_stream, mut client_stream) = make_channel(
+            max_size_per_write,
+            sender_checksum_enabled,
+            receiver_checksum_enabled,
+        );
         for _ in 0..800 {
             let message = (0..(rand::thread_rng().gen_range(0..(u8::MAX as u32 + 1) / 4)))
                 .collect::<Vec<_>>();
@@ -339,8 +646,17 @@ async fn random_len_test() {
 
 #[tokio::test]
 async fn u16_len_message() {
-    for size in interesting_sizes() {
-        let (mut server_stream, mut client_stream) = make_channel(size);
+    for TestParameters {
+        max_size_per_write,
+        sender_checksum_enabled,
+        receiver_checksum_enabled,
+    } in standard_test_parameter_set()
+    {
+        let (mut server_stream, mut client_stream) = make_channel(
+            max_size_per_write,
+            sender_checksum_enabled,
+            receiver_checksum_enabled,
+        );
         let message = (0..(u8::MAX as u16 + 1) / 2).collect::<Vec<_>>();
         let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
         assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
@@ -350,8 +666,17 @@ async fn u16_len_message() {
 
 #[tokio::test]
 async fn u16_len_messages() {
-    for size in interesting_sizes() {
-        let (mut server_stream, mut client_stream) = make_channel(size);
+    for TestParameters {
+        max_size_per_write,
+        sender_checksum_enabled,
+        receiver_checksum_enabled,
+    } in standard_test_parameter_set()
+    {
+        let (mut server_stream, mut client_stream) = make_channel(
+            max_size_per_write,
+            sender_checksum_enabled,
+            receiver_checksum_enabled,
+        );
         for _ in 0..10 {
             let message = (0..(u8::MAX as u16 + 1) / 2)
                 .map(|_| 258u16)
@@ -367,8 +692,17 @@ async fn u16_len_messages() {
 
 #[tokio::test]
 async fn u32_len_message() {
-    for size in interesting_sizes() {
-        let (mut server_stream, mut client_stream) = make_channel(size);
+    for TestParameters {
+        max_size_per_write,
+        sender_checksum_enabled,
+        receiver_checksum_enabled,
+    } in standard_test_parameter_set()
+    {
+        let (mut server_stream, mut client_stream) = make_channel(
+            max_size_per_write,
+            sender_checksum_enabled,
+            receiver_checksum_enabled,
+        );
         let message = (0..(u16::MAX as u32 + 1) / 4).collect::<Vec<_>>();
         let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
         assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
@@ -378,8 +712,17 @@ async fn u32_len_message() {
 
 #[tokio::test]
 async fn u32_len_messages() {
-    for size in interesting_sizes() {
-        let (mut server_stream, mut client_stream) = make_channel(size);
+    for TestParameters {
+        max_size_per_write,
+        sender_checksum_enabled,
+        receiver_checksum_enabled,
+    } in standard_test_parameter_set()
+    {
+        let (mut server_stream, mut client_stream) = make_channel(
+            max_size_per_write,
+            sender_checksum_enabled,
+            receiver_checksum_enabled,
+        );
         for _ in 0..10 {
             let message = (0..(u16::MAX as u32 + 1) / 4).collect::<Vec<_>>();
             let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
@@ -395,8 +738,17 @@ async fn u32_len_messages() {
 #[ignore]
 #[tokio::test]
 async fn u64_len_message() {
-    for size in interesting_sizes() {
-        let (mut server_stream, mut client_stream) = make_channel(size);
+    for TestParameters {
+        max_size_per_write,
+        sender_checksum_enabled,
+        receiver_checksum_enabled,
+    } in standard_test_parameter_set()
+    {
+        let (mut server_stream, mut client_stream) = make_channel(
+            max_size_per_write,
+            sender_checksum_enabled,
+            receiver_checksum_enabled,
+        );
         let message = (0..(u32::MAX as u64 + 1) / 8).collect::<Vec<_>>();
         let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
         assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
@@ -407,8 +759,17 @@ async fn u64_len_message() {
 #[ignore]
 #[tokio::test]
 async fn u64_len_messages() {
-    for size in interesting_sizes() {
-        let (mut server_stream, mut client_stream) = make_channel(size);
+    for TestParameters {
+        max_size_per_write,
+        sender_checksum_enabled,
+        receiver_checksum_enabled,
+    } in standard_test_parameter_set()
+    {
+        let (mut server_stream, mut client_stream) = make_channel(
+            max_size_per_write,
+            sender_checksum_enabled,
+            receiver_checksum_enabled,
+        );
         for _ in 0..10 {
             let message = (0..(u32::MAX as u64 + 1) / 8).collect::<Vec<_>>();
             let fut = start_send_helper(server_stream.take().unwrap(), message.clone());

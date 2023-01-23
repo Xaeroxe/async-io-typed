@@ -16,8 +16,10 @@
 
 use std::{
     collections::VecDeque,
+    hash::Hasher,
     io,
     marker::PhantomData,
+    mem::size_of,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -26,6 +28,7 @@ use bincode::Options;
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_util::{stream::Stream, Sink, SinkExt};
 use serde::{de::DeserializeOwned, Serialize};
+use siphasher::sip::SipHasher;
 
 #[cfg(test)]
 mod tests;
@@ -35,45 +38,118 @@ const U32_MARKER: u8 = 253;
 const U64_MARKER: u8 = 254;
 const ZST_MARKER: u8 = 255;
 
+// These values chosen such that zeroed data and data that is all ones doesn't resemble either of them.
+const CHECKSUM_ENABLED: u8 = 2;
+const CHECKSUM_DISABLED: u8 = 3;
+
+// Current protocol version. The original implementation had no version number, version 2 is the first version with a version number.
+const PROTOCOL_VERSION: u64 = 2;
+
 /// A duplex async connection for sending and receiving messages of a particular type.
 #[derive(Debug)]
-pub struct DuplexStreamTyped<RW, T: Serialize + DeserializeOwned + Unpin> {
-    rw: RW,
+pub struct DuplexStreamTyped<
+    RW: AsyncRead + AsyncWrite + Unpin,
+    T: Serialize + DeserializeOwned + Unpin,
+> {
+    rw: Option<RW>,
     read_state: AsyncReadState,
     read_buffer: Vec<u8>,
     write_state: AsyncWriteState,
     write_buffer: Vec<u8>,
     primed_values: VecDeque<T>,
-    size_limit: u64,
+    checksum_read_state: ChecksumReadState,
+    message_features: MessageFeatures,
 }
 
-impl<RW: AsyncRead + AsyncWrite, T: Serialize + DeserializeOwned + Unpin> DuplexStreamTyped<RW, T> {
+impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin>
+    DuplexStreamTyped<RW, T>
+{
     /// Creates a duplex typed reader and writer, initializing it with the given size limit specified in bytes.
+    /// Checksums are used to validate that messages arrived without corruption. **The checksum will only be used
+    /// if both the reader and the writer enable it. If either one disables it, then no checking is performed.**
     ///
-    /// Be careful, large limits might create a vulnerability to a Denial of Service attack.
-    pub fn new_with_limit(rw: RW, size_limit: u64) -> Self {
+    /// Be careful, large size limits might create a vulnerability to a Denial of Service attack.
+    pub fn new_with_limit(rw: RW, size_limit: u64, checksum_enabled: bool) -> Self {
         Self {
-            rw,
-            read_state: AsyncReadState::Idle,
+            rw: Some(rw),
+            read_state: AsyncReadState::ReadingVersion {
+                version_in_progress: [0; 8],
+                version_in_progress_assigned: 0,
+            },
             read_buffer: Vec::new(),
-            write_state: AsyncWriteState::Idle,
+            write_state: AsyncWriteState::WritingVersion {
+                version: PROTOCOL_VERSION.to_le_bytes(),
+                len_sent: 0,
+            },
             write_buffer: Vec::new(),
             primed_values: VecDeque::new(),
-            size_limit,
+            checksum_read_state: if checksum_enabled {
+                ChecksumReadState::Yes
+            } else {
+                ChecksumReadState::No
+            },
+            message_features: MessageFeatures {
+                size_limit,
+                checksum_enabled,
+            },
         }
     }
 
     /// Creates a duplex typed reader and writer, initializing it with a default size limit of 1 MB per message.
-    pub fn new(rw: RW) -> Self {
-        Self::new_with_limit(rw, 1024_u64.pow(2))
+    /// Checksums are used to validate that messages arrived without corruption. **The checksum will only be used
+    /// if both the reader and the writer enable it. If either one disables it, then no checking is performed.**
+    pub fn new(rw: RW, checksum_enabled: bool) -> Self {
+        Self::new_with_limit(rw, 1024_u64.pow(2), checksum_enabled)
     }
 
+    /// Returns a reference to the raw I/O primitive that this type is using.
     pub fn inner(&self) -> &RW {
-        &self.rw
+        self.rw.as_ref().expect("infallible")
     }
 
-    pub fn into_inner(self) -> RW {
-        self.rw
+    /// Consumes this `DuplexStreamTyped` and returns the raw I/O primitive that was being used.
+    pub fn into_inner(mut self) -> RW {
+        self.rw.take().expect("infallible")
+    }
+
+    /// `DuplexStreamTyped` keeps memory buffers for sending and receiving values which are the same size as the largest
+    /// message that's been sent or received. If the message size varies a lot, you might find yourself wasting
+    /// memory space. This function will reduce the memory usage as much as is possible without impeding
+    /// functioning. Overuse of this function may cause excessive memory allocations when the buffer
+    /// needs to grow.
+    pub fn optimize_memory_usage(&mut self) {
+        match self.read_state {
+            AsyncReadState::ReadingItem { .. } => self.read_buffer.shrink_to_fit(),
+            _ => {
+                self.read_buffer = Vec::new();
+            }
+        }
+        match self.write_state {
+            AsyncWriteState::WritingLen { .. } | AsyncWriteState::WritingValue { .. } => {
+                self.write_buffer.shrink_to_fit()
+            }
+            _ => {
+                self.write_buffer = Vec::new();
+            }
+        }
+    }
+
+    /// Reports the size of the memory buffers used for sending and receiving values. You can shrink these buffers as much as
+    /// possible with [`Self::optimize_memory_usage`].
+    pub fn current_memory_usage(&self) -> usize {
+        self.write_buffer.capacity() + self.read_buffer.capacity()
+    }
+
+    /// Returns true if checksums are enabled for this channel. This does not guarantee that the reader is
+    /// actually using those checksum values, it only reflects whether checksums are being sent.
+    pub fn checksum_send_enabled(&self) -> bool {
+        self.message_features.checksum_enabled
+    }
+
+    /// Returns true if checksums are enabled for this channel. This may become false after receiving the first value.
+    /// If that happens, the writer may have disabled checksums, so there is no checksum for the reader to check.
+    pub fn checksum_receive_enabled(&self) -> bool {
+        self.checksum_read_state == ChecksumReadState::Yes
     }
 }
 
@@ -87,10 +163,18 @@ impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin
             ref mut rw,
             ref mut read_state,
             ref mut read_buffer,
-            ref size_limit,
+            ref message_features,
+            ref mut checksum_read_state,
             ..
         } = *self.as_mut();
-        AsyncReadTyped::poll_next_impl(read_state, rw, read_buffer, *size_limit, cx)
+        AsyncReadTyped::poll_next_impl(
+            read_state,
+            rw.as_mut().expect("infallible"),
+            read_buffer,
+            message_features.size_limit,
+            checksum_read_state,
+            cx,
+        )
     }
 }
 
@@ -111,18 +195,19 @@ impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let Self {
             ref mut rw,
-            ref size_limit,
             ref mut write_state,
             ref mut write_buffer,
             ref mut primed_values,
+            ref message_features,
             ..
         } = *self.as_mut();
+        let rw = rw.as_mut().expect("infallible");
         match futures_core::ready!(AsyncWriteTyped::maybe_send(
             rw,
-            *size_limit,
             write_state,
             write_buffer,
             primed_values,
+            *message_features,
             cx,
             false,
         ))? {
@@ -137,18 +222,19 @@ impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let Self {
             ref mut rw,
-            ref size_limit,
             ref mut write_state,
             ref mut write_buffer,
             ref mut primed_values,
+            ref message_features,
             ..
         } = *self.as_mut();
+        let rw = rw.as_mut().expect("infallible");
         match futures_core::ready!(AsyncWriteTyped::maybe_send(
             rw,
-            *size_limit,
             write_state,
             write_buffer,
             primed_values,
+            *message_features,
             cx,
             true,
         ))? {
@@ -157,6 +243,16 @@ impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin
                 Pin::new(rw).poll_close(cx).map(|r| r.map_err(Error::Io))
             }
             None => Poll::Ready(Ok(())),
+        }
+    }
+}
+
+impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + Unpin + DeserializeOwned> Drop
+    for DuplexStreamTyped<RW, T>
+{
+    fn drop(&mut self) {
+        if self.rw.is_some() {
+            let _ = futures_executor::block_on(SinkExt::close(self));
         }
     }
 }
@@ -176,6 +272,22 @@ pub enum Error {
     /// A message was received that exceeded the configured length limit
     #[error("message received exceeded configured length limit, terminating connection")]
     ReceivedMessageTooLarge,
+    /// A checksum mismatch occurred, indicating that the data was corrupted. This error will never occur if
+    /// either side of the channel has checksums disabled.
+    #[error("checksum mismatch, data corrupted or there was a protocol mismatch")]
+    ChecksumMismatch {
+        sent_checksum: u64,
+        computed_checksum: u64,
+    },
+    /// The peer is using an incompatible protocol version.
+    #[error("the peer is using an incompatible protocol version. Our version {our_version}, Their version {their_version}")]
+    ProtocolVersionMismatch {
+        our_version: u64,
+        their_version: u64,
+    },
+    /// When exchanging information about whether to use a checksum or not, the peer sent us something unexpected.
+    #[error("checksum handshake failed, expected {CHECKSUM_ENABLED} or {CHECKSUM_DISABLED}, got {checksum_value}")]
+    ChecksumHandshakeFailed { checksum_value: u8 },
 }
 
 fn bincode_options(size_limit: u64) -> impl Options {
@@ -195,21 +307,43 @@ pub struct AsyncReadTyped<R, T: Serialize + DeserializeOwned + Unpin> {
     size_limit: u64,
     state: AsyncReadState,
     item_buffer: Vec<u8>,
+    checksum_read_state: ChecksumReadState,
     _phantom: PhantomData<T>,
 }
 
 #[derive(Debug)]
 enum AsyncReadState {
+    ReadingVersion {
+        version_in_progress: [u8; 8],
+        version_in_progress_assigned: usize,
+    },
+    ReadingChecksumEnabled,
     Idle,
     ReadingLen {
         len_read_mode: LenReadMode,
         len_in_progress: [u8; 8],
-        len_in_progress_assigned: u8,
+        len_in_progress_assigned: usize,
     },
     ReadingItem {
         len_read: usize,
     },
+    ReadingChecksum {
+        checksum_in_progress: [u8; 8],
+        checksum_assigned: usize,
+    },
     Finished,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ChecksumReadState {
+    /// The writer will not send checksums, the reader can't use them.
+    No,
+    /// The writer will send checksums, and we want to validate against them.
+    /// Checksums are enabled for both sides.
+    Yes,
+    /// The writer will send checksums, and we want to ignore them. Checksums
+    /// are enabled for the writer, and disabled for the reader.
+    Ignore,
 }
 
 impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> Stream
@@ -223,9 +357,17 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> Stream
             ref size_limit,
             ref mut item_buffer,
             ref mut state,
+            ref mut checksum_read_state,
             _phantom,
         } = &mut *self;
-        Self::poll_next_impl(state, raw, item_buffer, *size_limit, cx)
+        Self::poll_next_impl(
+            state,
+            raw,
+            item_buffer,
+            *size_limit,
+            checksum_read_state,
+            cx,
+        )
     }
 }
 
@@ -233,25 +375,35 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncReadTyp
     /// Creates a typed reader, initializing it with the given size limit specified in bytes.
     ///
     /// Be careful, large limits might create a vulnerability to a Denial of Service attack.
-    pub fn new_with_limit(raw: R, size_limit: u64) -> Self {
+    pub fn new_with_limit(raw: R, size_limit: u64, checksum_enabled: bool) -> Self {
         Self {
             raw,
             size_limit,
-            state: AsyncReadState::Idle,
+            state: AsyncReadState::ReadingVersion {
+                version_in_progress: [0; 8],
+                version_in_progress_assigned: 0,
+            },
             item_buffer: Vec::new(),
+            checksum_read_state: if checksum_enabled {
+                ChecksumReadState::Yes
+            } else {
+                ChecksumReadState::No
+            },
             _phantom: PhantomData,
         }
     }
 
     /// Creates a duplex typed reader and writer, initializing it with a default size limit of 1 MB.
-    pub fn new(raw: R) -> Self {
-        Self::new_with_limit(raw, 1024u64.pow(2))
+    pub fn new(raw: R, checksum_enabled: bool) -> Self {
+        Self::new_with_limit(raw, 1024u64.pow(2), checksum_enabled)
     }
 
+    /// Returns a reference to the raw I/O primitive that this type is using.
     pub fn inner(&self) -> &R {
         &self.raw
     }
 
+    /// Consumes this `AsyncReadTyped` and returns the raw I/O primitive that was being used.
     pub fn into_inner(self) -> R {
         self.raw
     }
@@ -270,15 +422,86 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncReadTyp
         }
     }
 
+    /// Reports the size of the memory buffer used for receiving values. You can shrink this buffer as much as
+    /// possible with [`Self::optimize_memory_usage`].
+    pub fn current_memory_usage(&self) -> usize {
+        self.item_buffer.capacity()
+    }
+
+    /// Returns true if checksums are enabled for this channel. This may become false after receiving the first value.
+    /// If that happens, the writer may have disabled checksums, so there is no checksum for the reader to check.
+    pub fn checksum_enabled(&self) -> bool {
+        self.checksum_read_state == ChecksumReadState::Yes
+    }
+
     fn poll_next_impl(
         state: &mut AsyncReadState,
         mut raw: &mut R,
         item_buffer: &mut Vec<u8>,
         size_limit: u64,
+        checksum_read_state: &mut ChecksumReadState,
         cx: &mut Context,
     ) -> Poll<Option<Result<T, Error>>> {
         loop {
             return match state {
+                AsyncReadState::ReadingVersion {
+                    version_in_progress,
+                    version_in_progress_assigned,
+                } => {
+                    while *version_in_progress_assigned < size_of::<u64>() {
+                        let len = futures_core::ready!(Pin::new(&mut raw).poll_read(
+                            cx,
+                            &mut version_in_progress[(*version_in_progress_assigned)..]
+                        ))?;
+                        *version_in_progress_assigned += len;
+                    }
+                    let version = u64::from_le_bytes(*version_in_progress);
+                    if version != PROTOCOL_VERSION {
+                        *state = AsyncReadState::Finished;
+                        return Poll::Ready(Some(Err(Error::ProtocolVersionMismatch {
+                            our_version: PROTOCOL_VERSION,
+                            their_version: version,
+                        })));
+                    }
+                    *state = AsyncReadState::ReadingChecksumEnabled;
+                    continue;
+                }
+                AsyncReadState::ReadingChecksumEnabled => {
+                    let mut checksum_enabled = [0];
+                    if futures_core::ready!(Pin::new(&mut raw).poll_read(cx, &mut checksum_enabled))?
+                        == 1
+                    {
+                        match checksum_enabled[0] {
+                            CHECKSUM_ENABLED => {
+                                match *checksum_read_state {
+                                    ChecksumReadState::Yes => {
+                                        // Do nothing, we are in agreement that a checksum should be used.
+                                    }
+                                    ChecksumReadState::No => {
+                                        // The peer is going to send checksums and we can't tell them to stop.
+                                        // Ignore the checksums.
+                                        *checksum_read_state = ChecksumReadState::Ignore;
+                                    }
+                                    ChecksumReadState::Ignore => {
+                                        // This should never happen, but if it does we can continue ignoring them I suppose.
+                                    }
+                                }
+                            }
+                            CHECKSUM_DISABLED => {
+                                // We can't use checksums if the peer won't send them, so disable them.
+                                *checksum_read_state = ChecksumReadState::No;
+                            }
+                            _ => {
+                                *state = AsyncReadState::Finished;
+                                return Poll::Ready(Some(Err(Error::ChecksumHandshakeFailed {
+                                    checksum_value: checksum_enabled[0],
+                                })));
+                            }
+                        }
+                        *state = AsyncReadState::Idle;
+                    }
+                    continue;
+                }
                 AsyncReadState::Idle => {
                     let mut buf = [0];
                     futures_core::ready!(Pin::new(&mut raw).poll_read(cx, &mut buf))?;
@@ -305,11 +528,8 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncReadTyp
                             };
                         }
                         ZST_MARKER => {
-                            return Poll::Ready(Some(
-                                bincode_options(size_limit)
-                                    .deserialize(&[])
-                                    .map_err(Error::Bincode),
-                            ));
+                            item_buffer.truncate(0);
+                            *state = AsyncReadState::ReadingItem { len_read: 0 };
                         }
                         0 => {
                             *state = AsyncReadState::Finished;
@@ -328,7 +548,7 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncReadTyp
                     ref mut len_in_progress_assigned,
                 } => {
                     let mut buf = [0; 8];
-                    let accumulated = *len_in_progress_assigned as usize;
+                    let accumulated = *len_in_progress_assigned;
                     let slice = match len_read_mode {
                         LenReadMode::U16 => &mut buf[accumulated..2],
                         LenReadMode::U32 => &mut buf[accumulated..4],
@@ -337,7 +557,7 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncReadTyp
                     let len = futures_core::ready!(Pin::new(&mut raw).poll_read(cx, slice))?;
                     len_in_progress[accumulated..(accumulated + len)]
                         .copy_from_slice(&slice[..len]);
-                    *len_in_progress_assigned += len as u8;
+                    *len_in_progress_assigned += len;
                     if len == slice.len() {
                         let new_len = match len_read_mode {
                             LenReadMode::U16 => u16::from_le_bytes(
@@ -364,13 +584,54 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncReadTyp
                         )?;
                         *len_read += len;
                     }
-                    let ret = Poll::Ready(Some(
-                        bincode_options(size_limit)
-                            .deserialize(item_buffer)
-                            .map_err(Error::Bincode),
-                    ));
+                    if [ChecksumReadState::Yes, ChecksumReadState::Ignore]
+                        .contains(checksum_read_state)
+                    {
+                        *state = AsyncReadState::ReadingChecksum {
+                            checksum_in_progress: [0; 8],
+                            checksum_assigned: 0,
+                        };
+                        continue;
+                    } else {
+                        let ret = Poll::Ready(Some(
+                            bincode_options(size_limit)
+                                .deserialize(item_buffer)
+                                .map_err(Error::Bincode),
+                        ));
+                        *state = AsyncReadState::Idle;
+                        ret
+                    }
+                }
+                AsyncReadState::ReadingChecksum {
+                    checksum_in_progress,
+                    checksum_assigned,
+                } => {
+                    while *checksum_assigned < size_of::<u64>() {
+                        let len = futures_core::ready!(Pin::new(&mut raw)
+                            .poll_read(cx, &mut checksum_in_progress[(*checksum_assigned)..]))?;
+                        *checksum_assigned += len;
+                    }
+                    let ret = (*checksum_read_state == ChecksumReadState::Yes)
+                        .then(|| {
+                            let sent_checksum = u64::from_le_bytes(*checksum_in_progress);
+                            let mut hasher = SipHasher::new();
+                            hasher.write(item_buffer);
+                            let computed_checksum = hasher.finish();
+                            (sent_checksum != computed_checksum).then_some(Err(
+                                Error::ChecksumMismatch {
+                                    sent_checksum,
+                                    computed_checksum,
+                                },
+                            ))
+                        })
+                        .flatten()
+                        .unwrap_or_else(|| {
+                            bincode_options(size_limit)
+                                .deserialize(item_buffer)
+                                .map_err(Error::Bincode)
+                        });
                     *state = AsyncReadState::Idle;
-                    ret
+                    Poll::Ready(Some(ret))
                 }
                 AsyncReadState::Finished => Poll::Ready(None),
             };
@@ -389,14 +650,19 @@ enum LenReadMode {
 #[derive(Debug)]
 pub struct AsyncWriteTyped<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> {
     raw: Option<W>,
-    size_limit: u64,
     write_buffer: Vec<u8>,
     state: AsyncWriteState,
     primed_values: VecDeque<T>,
+    message_features: MessageFeatures,
 }
 
 #[derive(Debug)]
 enum AsyncWriteState {
+    WritingVersion {
+        version: [u8; 8],
+        len_sent: usize,
+    },
+    WritingChecksumEnabled,
     Idle,
     WritingLen {
         current_len: [u8; 9],
@@ -406,8 +672,18 @@ enum AsyncWriteState {
     WritingValue {
         bytes_sent: usize,
     },
+    WritingChecksum {
+        checksum: [u8; 8],
+        len_sent: usize,
+    },
     Closing,
     Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MessageFeatures {
+    size_limit: u64,
+    checksum_enabled: bool,
 }
 
 impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> Sink<T>
@@ -427,17 +703,17 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> Sink<T>
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let Self {
             ref mut raw,
-            ref size_limit,
             ref mut write_buffer,
             ref mut state,
             ref mut primed_values,
+            ref message_features,
         } = *self.as_mut();
         match futures_core::ready!(Self::maybe_send(
             raw.as_mut().expect("infallible"),
-            *size_limit,
             state,
             write_buffer,
             primed_values,
+            *message_features,
             cx,
             false,
         ))? {
@@ -454,17 +730,17 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> Sink<T>
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let Self {
             ref mut raw,
-            ref size_limit,
             ref mut state,
             ref mut write_buffer,
             ref mut primed_values,
+            ref message_features,
         } = *self.as_mut();
         match futures_core::ready!(Self::maybe_send(
             raw.as_mut().expect("infallible"),
-            *size_limit,
             state,
             write_buffer,
             primed_values,
+            *message_features,
             cx,
             true,
         ))? {
@@ -482,15 +758,40 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> Sink<T>
 impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncWriteTyped<W, T> {
     fn maybe_send(
         raw: &mut W,
-        size_limit: u64,
         state: &mut AsyncWriteState,
         write_buffer: &mut Vec<u8>,
         primed_values: &mut VecDeque<T>,
+        message_features: MessageFeatures,
         cx: &mut Context<'_>,
         closing: bool,
     ) -> Poll<Result<Option<()>, Error>> {
+        let MessageFeatures {
+            checksum_enabled,
+            size_limit,
+        } = message_features;
         loop {
             return match state {
+                AsyncWriteState::WritingVersion { version, len_sent } => {
+                    while *len_sent < size_of::<u64>() {
+                        let len = futures_core::ready!(
+                            Pin::new(&mut *raw).poll_write(cx, &version[(*len_sent)..])
+                        )?;
+                        *len_sent += len;
+                    }
+                    *state = AsyncWriteState::WritingChecksumEnabled;
+                    continue;
+                }
+                AsyncWriteState::WritingChecksumEnabled => {
+                    let to_send = if checksum_enabled {
+                        CHECKSUM_ENABLED
+                    } else {
+                        CHECKSUM_DISABLED
+                    };
+                    if futures_core::ready!(Pin::new(&mut *raw).poll_write(cx, &[to_send]))? == 1 {
+                        *state = AsyncWriteState::Idle;
+                    }
+                    continue;
+                }
                 AsyncWriteState::Idle => {
                     if let Some(item) = primed_values.pop_back() {
                         write_buffer.clear();
@@ -556,24 +857,47 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncWriteT
                     ref len_to_be_sent,
                     ref mut len_sent,
                 } => {
-                    let len = futures_core::ready!(Pin::new(&mut *raw)
-                        .poll_write(cx, &current_len[(*len_sent)..(*len_to_be_sent)]))?;
-                    *len_sent += len;
-                    if *len_sent == *len_to_be_sent {
-                        *state = AsyncWriteState::WritingValue { bytes_sent: 0 };
+                    while *len_sent < *len_to_be_sent {
+                        let len = futures_core::ready!(Pin::new(&mut *raw)
+                            .poll_write(cx, &current_len[(*len_sent)..(*len_to_be_sent)]))?;
+                        *len_sent += len;
                     }
+                    *state = AsyncWriteState::WritingValue { bytes_sent: 0 };
                     continue;
                 }
                 AsyncWriteState::WritingValue { bytes_sent } => {
-                    let len = futures_core::ready!(
-                        Pin::new(&mut *raw).poll_write(cx, &write_buffer[*bytes_sent..])
-                    )?;
-                    *bytes_sent += len;
-                    if *bytes_sent == write_buffer.len() {
+                    while *bytes_sent < write_buffer.len() {
+                        let len = futures_core::ready!(
+                            Pin::new(&mut *raw).poll_write(cx, &write_buffer[*bytes_sent..])
+                        )?;
+                        *bytes_sent += len;
+                    }
+                    if checksum_enabled {
+                        let mut hasher = SipHasher::new();
+                        hasher.write(write_buffer);
+                        let checksum = hasher.finish();
+                        *state = AsyncWriteState::WritingChecksum {
+                            checksum: checksum.to_le_bytes(),
+                            len_sent: 0,
+                        };
+                    } else {
                         *state = AsyncWriteState::Idle;
                         if primed_values.is_empty() {
                             return Poll::Ready(Ok(Some(())));
                         }
+                    }
+                    continue;
+                }
+                AsyncWriteState::WritingChecksum { checksum, len_sent } => {
+                    while *len_sent < size_of::<u64>() {
+                        let len = futures_core::ready!(
+                            Pin::new(&mut *raw).poll_write(cx, &checksum[*len_sent..])
+                        )?;
+                        *len_sent += len;
+                    }
+                    *state = AsyncWriteState::Idle;
+                    if primed_values.is_empty() {
+                        return Poll::Ready(Ok(Some(())));
                     }
                     continue;
                 }
@@ -594,27 +918,39 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncWriteT
 
 impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncWriteTyped<W, T> {
     /// Creates a typed writer, initializing it with the given size limit specified in bytes.
+    /// Checksums are used to validate that messages arrived without corruption. **The checksum will only be used
+    /// if both the reader and the writer enable it. If either one disables it, then no checking is performed.**
     ///
-    /// Be careful, large limits might create a vulnerability to a Denial of Service attack.
-    pub fn new_with_limit(raw: W, size_limit: u64) -> Self {
+    /// Be careful, large size limits might create a vulnerability to a Denial of Service attack.
+    pub fn new_with_limit(raw: W, size_limit: u64, checksum_enabled: bool) -> Self {
         Self {
             raw: Some(raw),
-            size_limit,
             write_buffer: Vec::new(),
-            state: AsyncWriteState::Idle,
+            state: AsyncWriteState::WritingVersion {
+                version: PROTOCOL_VERSION.to_le_bytes(),
+                len_sent: 0,
+            },
+            message_features: MessageFeatures {
+                size_limit,
+                checksum_enabled,
+            },
             primed_values: VecDeque::new(),
         }
     }
 
     /// Creates a typed writer, initializing it with a default size limit of 1 MB per message.
-    pub fn new(raw: W) -> Self {
-        Self::new_with_limit(raw, 1024u64.pow(2))
+    /// Checksums are used to validate that messages arrived without corruption. **The checksum will only be used
+    /// if both the reader and the writer enable it. If either one disables it, then no checking is performed.**
+    pub fn new(raw: W, checksum_enabled: bool) -> Self {
+        Self::new_with_limit(raw, 1024u64.pow(2), checksum_enabled)
     }
 
+    /// Returns a reference to the raw I/O primitive that this type is using.
     pub fn inner(&self) -> &W {
         self.raw.as_ref().expect("infallible")
     }
 
+    /// Consumes this `AsyncWriteTyped` and returns the raw I/O primitive that was being used.
     pub fn into_inner(mut self) -> W {
         self.raw.take().expect("infallible")
     }
@@ -633,6 +969,18 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncWriteT
                 self.write_buffer = Vec::new();
             }
         }
+    }
+
+    /// Reports the size of the memory buffer used for sending values. You can shrink this buffer as much as
+    /// possible with [`Self::optimize_memory_usage`].
+    pub fn current_memory_usage(&self) -> usize {
+        self.write_buffer.capacity()
+    }
+
+    /// Returns true if checksums are enabled for this channel. This does not guarantee that the reader is
+    /// actually using those checksum values, it only reflects whether checksums are being sent.
+    pub fn checksum_enabled(&self) -> bool {
+        self.message_features.checksum_enabled
     }
 }
 

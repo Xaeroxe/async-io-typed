@@ -39,10 +39,26 @@ in debugging, that format is documented here.
 
 ### High-level overview
 
-The byte stream is split up into messages. Every message begins with a `length` value. After `length` bytes have 
+***Connection Initial Description***
+
+Version 1 of the protocol did not send this description. Version 2 is the first version that sends a startup description.
+The first 8 bytes sent on the channel are the little endian protocol version number. If the reader is not compatible with the message version provided, it must
+terminate immediately. Immediately following the version, the sender will describe the features of the message stream it is about to send. Those features are as follows.
+
+**Version 1**
+
+Version 1 did not send an initial description. All optional features are disabled in version 1.
+
+**Version 2**
+- `name`: checksum_enabled, `size`: 1 byte, `possible values`: 2 or 3, `notes`: 2 indicates checksums will be sent, 3 indicates checksums will not be sent.
+
+***Message stream***
+
+After the initial description, the byte stream is split up into messages. Every message begins with a `length` value. After `length` bytes have 
 been read, a new message can begin immediately afterward. This `length` value is the entirety of the header of a 
-message. Messages have no footer. The bytes read out of a message are then deserialized into a Rust type via
-[`bincode`](https://github.com/bincode-org/bincode), using the following configuration
+message. If checksums are enabled, the 8 bytes immediately following the message are the checksum of the message. This checksum is determined by hashing
+the bytes of the message using SipHash 2-4. If checksums are disabled, instead the next message begins immediately. The bytes from the message are then
+deserialized into a Rust type via [`bincode`](https://github.com/bincode-org/bincode), using the following configuration.
 
 ```rust,ignore
 bincode::DefaultOptions::new()
