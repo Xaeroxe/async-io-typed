@@ -20,6 +20,7 @@ use std::{
 
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
+use serde::{de::DeserializeOwned, Serialize};
 use tokio::sync::mpsc::{self, Receiver};
 use tokio_util::sync::PollSender;
 
@@ -43,7 +44,7 @@ impl AsyncWrite for BasicChannelSender {
         }
         let write_len = self.max_size_per_write.min(buf.len());
         self.sender
-            .send_item((&buf[..write_len]).to_vec())
+            .send_item(buf[..write_len].to_vec())
             .expect("receiver hung up!");
         Poll::Ready(Ok(write_len))
     }
@@ -71,7 +72,7 @@ impl AsyncRead for BasicChannelReceiver {
     ) -> Poll<futures_io::Result<usize>> {
         let mut len_written = 0;
         loop {
-            if self.last_received.len() > 0 {
+            if !self.last_received.is_empty() {
                 let copy_len = self.last_received.len().min(buf.len() - len_written);
                 buf[len_written..(len_written + copy_len)]
                     .copy_from_slice(&self.last_received[..copy_len]);
@@ -390,7 +391,7 @@ fn standard_test_parameter_set() -> impl Iterator<Item = TestParameters> {
     (1..=3)
         .chain(8..=10)
         .chain(Some(1024usize.pow(2)))
-        .map(|size| {
+        .flat_map(|size| {
             (0..1).map(move |sender_checksum_enabled| {
                 (0..1).map(move |receiver_checksum_enabled| {
                     (
@@ -401,7 +402,6 @@ fn standard_test_parameter_set() -> impl Iterator<Item = TestParameters> {
                 })
             })
         })
-        .flatten()
         .flatten()
         .map(
             |(max_size_per_write, sender_checksum_enabled, receiver_checksum_enabled)| {
