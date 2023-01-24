@@ -20,7 +20,10 @@ use std::{
 };
 
 use futures_io::{AsyncRead, AsyncWrite};
-use futures_util::io::{AsyncReadExt, AsyncWriteExt};
+use futures_util::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    Sink,
+};
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -360,11 +363,14 @@ use super::*;
 
 fn start_send_helper<
     T: Serialize + DeserializeOwned + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
+    S: Sink<T> + Unpin + Send + 'static,
 >(
-    mut s: AsyncWriteTyped<W, T>,
+    mut s: S,
     value: T,
-) -> JoinHandle<(AsyncWriteTyped<W, T>, Result<(), Error>)> {
+) -> JoinHandle<(S, Result<(), S::Error>)>
+where
+    S::Error: Send,
+{
     tokio::spawn(async move {
         let ret = s.send(value).await;
         (s, ret)
@@ -500,7 +506,7 @@ async fn hello_world_tokio_tcp() {
         .unwrap();
     let port = tcp_listener.local_addr().unwrap().port();
     let accept_fut = tokio::spawn(async move { tcp_listener.accept().await });
-    let mut client_stream = AsyncReadTyped::<_, Vec<u8>>::new(
+    let mut client_stream = DuplexStreamTyped::<_, Vec<u8>>::new(
         TcpStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
             .await
             .unwrap()
@@ -508,7 +514,7 @@ async fn hello_world_tokio_tcp() {
         true,
     );
     let (server_stream, _address) = accept_fut.await.unwrap().unwrap();
-    let mut server_stream = Some(AsyncWriteTyped::new(server_stream.compat_write(), true));
+    let mut server_stream = Some(DuplexStreamTyped::new(server_stream.compat_write(), true));
     let message = "Hello, world!".as_bytes().to_vec();
     let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
     assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
