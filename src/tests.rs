@@ -505,7 +505,7 @@ async fn hello_world_tokio_tcp() {
         .await
         .unwrap();
     let port = tcp_listener.local_addr().unwrap().port();
-    let accept_fut = tokio::spawn(async move { tcp_listener.accept().await });
+    let accept_fut = tcp_listener.accept();
     let mut client_stream = DuplexStreamTyped::<_, Vec<u8>>::new(
         TcpStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
             .await
@@ -513,7 +513,7 @@ async fn hello_world_tokio_tcp() {
             .compat(),
         true,
     );
-    let (server_stream, _address) = accept_fut.await.unwrap().unwrap();
+    let (server_stream, _address) = accept_fut.await.unwrap();
     let mut server_stream = Some(DuplexStreamTyped::new(server_stream.compat_write(), true));
     let message = "Hello, world!".as_bytes().to_vec();
     let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
