@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::{
+    net::{Ipv4Addr, SocketAddrV4},
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
@@ -21,8 +22,14 @@ use std::{
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 use serde::{de::DeserializeOwned, Serialize};
-use tokio::sync::mpsc::{self, Receiver};
-use tokio_util::sync::PollSender;
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::mpsc::{self, Receiver},
+};
+use tokio_util::{
+    compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt},
+    sync::PollSender,
+};
 
 // What follows is an intentionally obnoxious `AsyncRead` and `AsyncWrite` implementation. Please don't use this outside of tests.
 struct BasicChannelSender {
@@ -351,10 +358,13 @@ use tokio::task::JoinHandle;
 
 use super::*;
 
-fn start_send_helper<T: Serialize + DeserializeOwned + Unpin + Send + 'static>(
-    mut s: AsyncWriteTyped<BasicChannelSender, T>,
+fn start_send_helper<
+    T: Serialize + DeserializeOwned + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+>(
+    mut s: AsyncWriteTyped<W, T>,
     value: T,
-) -> JoinHandle<(AsyncWriteTyped<BasicChannelSender, T>, Result<(), Error>)> {
+) -> JoinHandle<(AsyncWriteTyped<W, T>, Result<(), Error>)> {
     tokio::spawn(async move {
         let ret = s.send(value).await;
         (s, ret)
@@ -480,6 +490,29 @@ async fn hello_world() {
         assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
         fut.await.unwrap().1.unwrap();
     }
+}
+
+// Mostly just here to have at least one test using sort of real world conditions.
+#[tokio::test]
+async fn hello_world_tokio_tcp() {
+    let tcp_listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let port = tcp_listener.local_addr().unwrap().port();
+    let accept_fut = tokio::spawn(async move { tcp_listener.accept().await });
+    let mut client_stream = AsyncReadTyped::<_, Vec<u8>>::new(
+        TcpStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap()
+            .compat(),
+        true,
+    );
+    let (server_stream, _address) = accept_fut.await.unwrap().unwrap();
+    let mut server_stream = Some(AsyncWriteTyped::new(server_stream.compat_write(), true));
+    let message = "Hello, world!".as_bytes().to_vec();
+    let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
+    assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
+    fut.await.unwrap().1.unwrap();
 }
 
 #[tokio::test]
