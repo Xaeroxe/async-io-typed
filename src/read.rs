@@ -1,6 +1,6 @@
 use crate::{
-    Error, CHECKSUM_DISABLED, CHECKSUM_ENABLED, PROTOCOL_VERSION, U16_MARKER, U32_MARKER,
-    U64_MARKER, ZST_MARKER,
+    ChecksumEnabled, Error, CHECKSUM_DISABLED, CHECKSUM_ENABLED, PROTOCOL_VERSION, U16_MARKER,
+    U32_MARKER, U64_MARKER, ZST_MARKER,
 };
 use bincode::Options;
 use futures_core::Stream;
@@ -89,7 +89,7 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncReadTyp
     /// Creates a typed reader, initializing it with the given size limit specified in bytes.
     ///
     /// Be careful, large limits might create a vulnerability to a Denial of Service attack.
-    pub fn new_with_limit(raw: R, size_limit: u64, checksum_enabled: bool) -> Self {
+    pub fn new_with_limit(raw: R, size_limit: u64, checksum_enabled: ChecksumEnabled) -> Self {
         Self {
             raw,
             size_limit,
@@ -98,17 +98,13 @@ impl<R: AsyncRead + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncReadTyp
                 version_in_progress_assigned: 0,
             },
             item_buffer: Vec::new(),
-            checksum_read_state: if checksum_enabled {
-                ChecksumReadState::Yes
-            } else {
-                ChecksumReadState::No
-            },
+            checksum_read_state: checksum_enabled.into(),
             _phantom: PhantomData,
         }
     }
 
     /// Creates a typed reader, initializing it with a default size limit of 1 MB.
-    pub fn new(raw: R, checksum_enabled: bool) -> Self {
+    pub fn new(raw: R, checksum_enabled: ChecksumEnabled) -> Self {
         Self::new_with_limit(raw, 1024u64.pow(2), checksum_enabled)
     }
 

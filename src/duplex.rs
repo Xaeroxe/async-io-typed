@@ -1,6 +1,6 @@
 use crate::read::{AsyncReadState, AsyncReadTyped, ChecksumReadState};
 use crate::write::{AsyncWriteState, AsyncWriteTyped, MessageFeatures};
-use crate::{Error, PROTOCOL_VERSION};
+use crate::{ChecksumEnabled, Error, PROTOCOL_VERSION};
 use futures_core::Stream;
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_util::{Sink, SinkExt};
@@ -34,7 +34,7 @@ impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin
     /// if both the reader and the writer enable it. If either one disables it, then no checking is performed.**
     ///
     /// Be careful, large size limits might create a vulnerability to a Denial of Service attack.
-    pub fn new_with_limit(rw: RW, size_limit: u64, checksum_enabled: bool) -> Self {
+    pub fn new_with_limit(rw: RW, size_limit: u64, checksum_enabled: ChecksumEnabled) -> Self {
         Self {
             rw: Some(rw),
             read_state: AsyncReadState::ReadingVersion {
@@ -48,14 +48,10 @@ impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin
             },
             write_buffer: Vec::new(),
             primed_values: VecDeque::new(),
-            checksum_read_state: if checksum_enabled {
-                ChecksumReadState::Yes
-            } else {
-                ChecksumReadState::No
-            },
+            checksum_read_state: checksum_enabled.into(),
             message_features: MessageFeatures {
                 size_limit,
-                checksum_enabled,
+                checksum_enabled: checksum_enabled.into(),
             },
         }
     }
@@ -63,7 +59,7 @@ impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin
     /// Creates a duplex typed reader and writer, initializing it with a default size limit of 1 MB per message.
     /// Checksums are used to validate that messages arrived without corruption. **The checksum will only be used
     /// if both the reader and the writer enable it. If either one disables it, then no checking is performed.**
-    pub fn new(rw: RW, checksum_enabled: bool) -> Self {
+    pub fn new(rw: RW, checksum_enabled: ChecksumEnabled) -> Self {
         Self::new_with_limit(rw, 1024_u64.pow(2), checksum_enabled)
     }
 

@@ -131,7 +131,7 @@ fn basic_channel(max_size_per_write: usize) -> (BasicChannelSender, BasicChannel
 #[tokio::test]
 async fn bad_protocol_version() {
     let (mut sender, receiver) = basic_channel(1024);
-    let mut typed_receiver = AsyncReadTyped::<_, u8>::new(receiver, false);
+    let mut typed_receiver = AsyncReadTyped::<_, u8>::new(receiver, ChecksumEnabled::No);
     // Intentionally send a message with a bad checksum
     let sent_value = 5;
     let mut message = Vec::from(0u64.to_le_bytes());
@@ -154,7 +154,7 @@ async fn bad_protocol_version() {
 #[tokio::test]
 async fn bad_checksum_enabled_value() {
     let (mut sender, receiver) = basic_channel(1024);
-    let mut typed_receiver = AsyncReadTyped::<_, u8>::new(receiver, false);
+    let mut typed_receiver = AsyncReadTyped::<_, u8>::new(receiver, ChecksumEnabled::No);
     // Intentionally send a message with a bad checksum
     let sent_value = 5;
     const BAD_CHECKSUM_ENABLED_VALUE: u8 = 42;
@@ -177,7 +177,7 @@ async fn bad_checksum_enabled_value() {
 #[tokio::test]
 async fn checksum_ignored() {
     let (mut sender, receiver) = basic_channel(1024);
-    let mut typed_receiver = AsyncReadTyped::new(receiver, false);
+    let mut typed_receiver = AsyncReadTyped::new(receiver, ChecksumEnabled::No);
     // Intentionally send a message with a bad checksum
     let sent_value = 5;
     let mut message = Vec::from(PROTOCOL_VERSION.to_le_bytes());
@@ -193,7 +193,7 @@ async fn checksum_ignored() {
 #[tokio::test]
 async fn checksum_unavailable() {
     let (mut sender, receiver) = basic_channel(1024);
-    let mut typed_receiver = AsyncReadTyped::<_, u8>::new(receiver, true);
+    let mut typed_receiver = AsyncReadTyped::<_, u8>::new(receiver, ChecksumEnabled::Yes);
     assert!(typed_receiver.checksum_enabled());
     // Send two message without checksums.
     const SENT_VALUE: u8 = 5;
@@ -218,7 +218,7 @@ async fn checksum_unavailable() {
 #[tokio::test]
 async fn checksum_used() {
     let (mut sender, receiver) = basic_channel(1024);
-    let mut typed_receiver = AsyncReadTyped::<_, u8>::new(receiver, true);
+    let mut typed_receiver = AsyncReadTyped::<_, u8>::new(receiver, ChecksumEnabled::Yes);
     // Intentionally send a message with a bad checksum
     const SENT_VALUE: u8 = 5;
     const SENT_VALUE_CHECKSUM: u64 = 10536747468361244917;
@@ -251,7 +251,7 @@ async fn checksum_used() {
 #[tokio::test]
 async fn checksum_unused() {
     let (mut sender, receiver) = basic_channel(1024);
-    let mut typed_receiver = AsyncReadTyped::<_, u8>::new(receiver, true);
+    let mut typed_receiver = AsyncReadTyped::<_, u8>::new(receiver, ChecksumEnabled::Yes);
     // Send two messages with no checksum
     const SENT_VALUE: u8 = 5;
     const SENT_VALUE_2: u8 = 20;
@@ -273,7 +273,7 @@ async fn checksum_unused() {
 #[tokio::test]
 async fn checksum_sent() {
     let (sender, mut receiver) = basic_channel(1024);
-    let mut typed_sender = AsyncWriteTyped::new(sender, true);
+    let mut typed_sender = AsyncWriteTyped::new(sender, ChecksumEnabled::Yes);
     const SENT_VALUE: u8 = 5;
     const SENT_VALUE_CHECKSUM: u64 = 10536747468361244917;
     typed_sender.send(SENT_VALUE).await.unwrap();
@@ -297,7 +297,7 @@ async fn checksum_sent() {
 #[tokio::test]
 async fn checksum_not_sent() {
     let (sender, mut receiver) = basic_channel(1024);
-    let mut typed_sender = AsyncWriteTyped::new(sender, false);
+    let mut typed_sender = AsyncWriteTyped::new(sender, ChecksumEnabled::No);
     const SENT_VALUE: u8 = 5;
     typed_sender.send(SENT_VALUE).await.unwrap();
     const SENT_VALUE_2: u8 = 20;
@@ -387,8 +387,8 @@ fn make_channel<T: DeserializeOwned + Serialize + Unpin>(
 ) {
     let (sender, receiver) = basic_channel(max_size_per_write);
     (
-        Some(AsyncWriteTyped::new(sender, sender_checksum_enabled)),
-        AsyncReadTyped::new(receiver, receiver_checksum_enabled),
+        Some(AsyncWriteTyped::new(sender, sender_checksum_enabled.into())),
+        AsyncReadTyped::new(receiver, receiver_checksum_enabled.into()),
     )
 }
 
@@ -511,10 +511,13 @@ async fn hello_world_tokio_tcp() {
             .await
             .unwrap()
             .compat(),
-        true,
+        ChecksumEnabled::Yes,
     );
     let (server_stream, _address) = accept_fut.await.unwrap();
-    let mut server_stream = Some(DuplexStreamTyped::new(server_stream.compat_write(), true));
+    let mut server_stream = Some(DuplexStreamTyped::new(
+        server_stream.compat_write(),
+        ChecksumEnabled::Yes,
+    ));
     let message = "Hello, world!".as_bytes().to_vec();
     let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
     assert_eq!(client_stream.next().await.unwrap().unwrap(), message);

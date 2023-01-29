@@ -1,6 +1,6 @@
 use crate::{
-    Error, CHECKSUM_DISABLED, CHECKSUM_ENABLED, PROTOCOL_VERSION, U16_MARKER, U32_MARKER,
-    U64_MARKER, ZST_MARKER,
+    ChecksumEnabled, Error, CHECKSUM_DISABLED, CHECKSUM_ENABLED, PROTOCOL_VERSION, U16_MARKER,
+    U32_MARKER, U64_MARKER, ZST_MARKER,
 };
 use bincode::Options;
 use futures_io::AsyncWrite;
@@ -223,7 +223,7 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncWriteT
     /// if both the reader and the writer enable it. If either one disables it, then no checking is performed.**
     ///
     /// Be careful, large size limits might create a vulnerability to a Denial of Service attack.
-    pub fn new_with_limit(raw: W, size_limit: u64, checksum_enabled: bool) -> Self {
+    pub fn new_with_limit(raw: W, size_limit: u64, checksum_enabled: ChecksumEnabled) -> Self {
         Self {
             raw: Some(raw),
             write_buffer: Vec::new(),
@@ -233,7 +233,7 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncWriteT
             },
             message_features: MessageFeatures {
                 size_limit,
-                checksum_enabled,
+                checksum_enabled: checksum_enabled.into(),
             },
             primed_values: VecDeque::new(),
         }
@@ -242,7 +242,7 @@ impl<W: AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin> AsyncWriteT
     /// Creates a typed writer, initializing it with a default size limit of 1 MB per message.
     /// Checksums are used to validate that messages arrived without corruption. **The checksum will only be used
     /// if both the reader and the writer enable it. If either one disables it, then no checking is performed.**
-    pub fn new(raw: W, checksum_enabled: bool) -> Self {
+    pub fn new(raw: W, checksum_enabled: ChecksumEnabled) -> Self {
         Self::new_with_limit(raw, 1024u64.pow(2), checksum_enabled)
     }
 

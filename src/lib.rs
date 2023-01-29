@@ -74,6 +74,37 @@ pub enum Error {
     ChecksumHandshakeFailed { checksum_value: u8 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ChecksumEnabled {
+    Yes,
+    No,
+}
+
+impl From<bool> for ChecksumEnabled {
+    fn from(value: bool) -> Self {
+        if value {
+            ChecksumEnabled::Yes
+        } else {
+            ChecksumEnabled::No
+        }
+    }
+}
+
+impl From<ChecksumEnabled> for bool {
+    fn from(value: ChecksumEnabled) -> Self {
+        value == ChecksumEnabled::Yes
+    }
+}
+
+impl From<ChecksumEnabled> for ChecksumReadState {
+    fn from(value: ChecksumEnabled) -> Self {
+        match value {
+            ChecksumEnabled::Yes => ChecksumReadState::Yes,
+            ChecksumEnabled::No => ChecksumReadState::No,
+        }
+    }
+}
+
 fn bincode_options(size_limit: u64) -> impl Options {
     // Two of these are defaults, so you might say this is over specified. I say it's future proof, as
     // bincode default changes won't introduce accidental breaking changes.
