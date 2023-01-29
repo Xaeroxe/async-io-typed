@@ -90,9 +90,7 @@ impl<RW: AsyncRead + AsyncWrite + Unpin, T: Serialize + DeserializeOwned + Unpin
             }
         }
         match self.write_state {
-            AsyncWriteState::WritingLen { .. } | AsyncWriteState::WritingValue { .. } => {
-                self.write_buffer.shrink_to_fit()
-            }
+            AsyncWriteState::WritingValue { .. } => self.write_buffer.shrink_to_fit(),
             _ => {
                 self.write_buffer = Vec::new();
             }
