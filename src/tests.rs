@@ -24,7 +24,7 @@ use futures_util::{
     io::{AsyncReadExt, AsyncWriteExt},
     Sink,
 };
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Serialize, Deserialize};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::mpsc::{self, Receiver},
@@ -519,6 +519,50 @@ async fn hello_world_tokio_tcp() {
     let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
     assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
     fut.await.unwrap().1.unwrap();
+}
+
+#[tokio::test]
+async fn blog_example() {
+    #[derive(Deserialize, Serialize)]
+    pub struct MyMessage {
+        pub field_1: bool,
+        pub field_2: String,
+    }
+
+    let tcp_listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    // Get the port number that the operating system assigned to us.
+    let port = tcp_listener.local_addr().unwrap().port();
+    // Start accepting a new connection. We intentionally don't await this future yet,
+    // because that would prevent us from creating the client connecting to it.
+    let accept_fut = tcp_listener.accept();
+    // Create a new `DuplexStreamTyped` which exchanges `MyMessage` type, by connecting
+    // to the newly opened TCP port. We then wrap the connection in a compatibility layer
+    // so that `tokio::io` and `futures_io` can work together. The second boolean parameter
+    // here disables checksums. TCP already does error checking for us, so we can disable the
+    // checksum.
+    let mut client_stream = DuplexStreamTyped::<_, MyMessage>::new(
+        TcpStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap()
+            .compat(),
+        ChecksumEnabled::No,
+    );
+    // Now that a connection is established, let's resolve our accept future from earlier.
+    let (server_stream, _address) = accept_fut.await.unwrap();
+    // Wrap the connection in a `DuplexStreamTyped`, with checksums off.
+    let mut server_stream = DuplexStreamTyped::new(server_stream.compat_write(), ChecksumEnabled::No);
+    // Let's compose the message to send
+    let message = MyMessage {
+        field_1: true,
+        field_2: String::from("Hello World!"),
+    };
+    // Send the message
+    server_stream.send(message).await.unwrap();
+    // Receive the message
+    let _ = client_stream.next().await.unwrap().unwrap();
+    // Do whatever you want to do with the received message...
 }
 
 #[tokio::test]
